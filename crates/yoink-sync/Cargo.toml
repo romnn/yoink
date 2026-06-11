@@ -1,0 +1,20 @@
+[package]
+name = "yoink-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+yoink-core = { workspace = true }
+yoink-discovery = { workspace = true }
+
+axum = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }

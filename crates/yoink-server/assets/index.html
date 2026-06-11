@@ -1,0 +1,1012 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>yoink</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%20fill='none'%20stroke='%237c8cff'%20stroke-width='2'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Crect%20x='5'%20y='3'%20width='14'%20height='18'%20rx='2'/%3E%3Cpath%20d='M13%207l-3%205h4l-3%205'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0d1017;
+    --bg-raise: #11151f;
+    --panel: #141927;
+    --panel-2: #1a2133;
+    --border: #222b40;
+    --border-soft: #1b2234;
+    --text: #e7eaf3;
+    --muted: #8d96ac;
+    --faint: #5d647a;
+    --accent: #7c8cff;
+    --accent-soft: rgba(124, 140, 255, 0.12);
+    --accent-edge: rgba(124, 140, 255, 0.45);
+    --accent-ink: #0a0d18;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --danger: #f97066;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  /* Custom `display` values on .toggle-label etc. would otherwise beat the
+     UA's [hidden] rule and un-hide them. */
+  [hidden] { display: none !important; }
+  body {
+    background: radial-gradient(1100px 500px at 50% -180px, #141b2e 0%, var(--bg) 62%) fixed var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent-soft); }
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  #reconnect {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 50;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-align: center;
+    padding: 4px 0;
+    color: var(--warn);
+    background: rgba(251, 191, 36, 0.09);
+    border-bottom: 1px solid rgba(251, 191, 36, 0.3);
+    backdrop-filter: blur(6px);
+  }
+
+  main { max-width: 680px; margin: 0 auto; padding: 36px 20px 90px; }
+
+  header {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .wordmark {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 21px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--text);
+    text-decoration: none;
+  }
+  .wordmark svg { width: 21px; height: 21px; color: var(--accent); flex: none; }
+  .device-chip {
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--bg-raise);
+    border: 1px solid var(--border-soft);
+    border-radius: 999px;
+    padding: 3px 11px;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  header .spacer { flex: 1; }
+  .chip {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 3px 11px;
+    border-radius: 999px;
+  }
+  .chip.warn {
+    color: var(--warn);
+    border: 1px solid rgba(251, 191, 36, 0.35);
+    background: rgba(251, 191, 36, 0.08);
+  }
+
+  .toggle-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+    flex: none;
+  }
+  .switch {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 36px; height: 21px;
+    border-radius: 11px;
+    background: #2a3245;
+    border: 1px solid #323c54;
+    position: relative;
+    cursor: pointer;
+    flex: none;
+    margin: 0;
+  }
+  .switch::after {
+    content: "";
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 15px; height: 15px;
+    border-radius: 50%;
+    background: #cdd3e1;
+  }
+  .switch:checked { background: var(--accent); border-color: var(--accent); }
+  .switch:checked::after { left: 17px; background: var(--accent-ink); }
+  .switch:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  nav {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 0 30px;
+    min-height: 35px;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 5px 14px;
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .pill:hover { color: var(--text); border-color: #36415c; background: var(--bg-raise); }
+  .pill.active {
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-color: var(--accent-edge);
+  }
+  .pill-hash { opacity: 0.55; font-weight: 700; }
+  .pill.active .pill-hash { opacity: 0.8; }
+  .pill-new { border-style: dashed; color: var(--faint); }
+  .pill-new:hover { color: var(--accent); border-color: var(--accent-edge); border-style: dashed; background: transparent; }
+  .pill-input { gap: 2px; padding: 5px 12px; border-color: var(--accent-edge); cursor: text; }
+  .pill-input input {
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    width: 11ch;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    padding: 0;
+  }
+  .pill-input input::placeholder { color: var(--faint); font-weight: 500; }
+  .pill-preview { font-size: 12px; color: var(--faint); padding: 0 2px; }
+
+  section { margin-bottom: 30px; }
+  h2 {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    margin: 0 0 10px 2px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 13px 16px;
+  }
+  .row + .row { border-top: 1px solid var(--border-soft); }
+  .grow { flex: 1; min-width: 0; }
+
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .dot.offline { background: #424c63; }
+  .dot.online { background: var(--warn); }
+  .dot.connected { background: var(--ok); }
+  .dot.mini { width: 7px; height: 7px; }
+
+  .peer-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .peer-status { font-size: 12px; color: var(--faint); flex: none; }
+
+  .room-hash { color: var(--accent); font-weight: 700; flex: none; width: 12px; text-align: center; }
+  .room-name { font-weight: 600; overflow-wrap: anywhere; }
+  .room-count { font-size: 12px; color: var(--faint); flex: none; }
+  .joined-chip {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    text-decoration: none;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 5px 10px;
+    flex: none;
+  }
+  .joined-chip:hover { color: var(--accent); background: var(--accent-soft); }
+
+  .empty {
+    padding: 28px 20px;
+    text-align: center;
+    color: var(--faint);
+    font-size: 14px;
+    text-wrap: balance;
+  }
+
+  .room-head { margin-bottom: 30px; }
+  .room-title-row { display: flex; align-items: baseline; gap: 12px; }
+  .room-title {
+    font-size: 24px;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    text-transform: none;
+    color: var(--text);
+    margin: 0;
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .room-title .room-hash { font-size: 24px; width: auto; margin-right: 2px; }
+  .member-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .member-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 4px 12px;
+    max-width: 100%;
+  }
+  .member-hint { font-size: 13px; color: var(--faint); padding: 4px 2px; }
+
+  .btn {
+    display: inline-block;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 6px 13px;
+    cursor: pointer;
+    flex: none;
+    text-decoration: none;
+  }
+  .btn:hover { border-color: #36415c; background: #202940; }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  .btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 700;
+  }
+  .btn.primary:hover { filter: brightness(1.1); }
+  .btn.primary:disabled { filter: none; }
+  .btn.small { font-size: 12px; padding: 5px 11px; }
+  .btn.quiet {
+    background: transparent;
+    border-color: transparent;
+    color: var(--faint);
+    font-weight: 500;
+  }
+  .btn.quiet:hover { color: var(--danger); background: rgba(249, 112, 102, 0.08); border-color: transparent; }
+  .btn.flash { color: var(--accent-ink); background: var(--ok); border-color: var(--ok); opacity: 1; }
+  .btn.flash:not(.primary) { color: var(--ok); background: rgba(74, 222, 128, 0.1); border-color: rgba(74, 222, 128, 0.4); }
+
+  #share-text {
+    display: block;
+    width: 100%;
+    min-height: 88px;
+    max-height: 40vh;
+    resize: none;
+    background: transparent;
+    color: var(--text);
+    border: none;
+    border-bottom: 1px solid var(--border-soft);
+    padding: 14px 16px;
+    font: inherit;
+    outline: none;
+  }
+  #share-text::placeholder { color: var(--faint); }
+  .share-card:focus-within { border-color: var(--accent-edge); }
+  .share-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px 10px 16px;
+  }
+  .hint { font-size: 12px; color: var(--faint); }
+  .hint kbd {
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--bg-raise);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    padding: 0 5px;
+  }
+
+  .entry { display: block; padding: 14px 16px; }
+  .entry + .entry { border-top: 1px solid var(--border-soft); }
+  .entry-text {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 4;
+    overflow: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+    margin: 0 0 10px;
+  }
+  .entry-text.expanded { display: block; -webkit-line-clamp: none; }
+  .entry-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .entry-meta {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--faint);
+  }
+  .entry-meta .entry-device, .row-meta .entry-device { color: var(--muted); font-weight: 600; }
+
+  .hero-card {
+    background: linear-gradient(180deg, rgba(124, 140, 255, 0.09), rgba(124, 140, 255, 0.02) 65%), var(--panel);
+    border: 1px solid var(--accent-edge);
+    border-radius: var(--radius);
+    box-shadow: 0 6px 28px rgba(124, 140, 255, 0.08);
+    padding: 16px 18px 13px;
+  }
+  .hero-text {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 6;
+    overflow: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+    font-size: 17px;
+    line-height: 1.6;
+    margin: 0 0 14px;
+  }
+  .hero-text.expanded { display: block; -webkit-line-clamp: none; }
+
+  .earlier { margin-top: 14px; }
+  .earlier-head {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--faint);
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 2px;
+    cursor: pointer;
+  }
+  .earlier-head:hover { color: var(--muted); }
+  .earlier-chevron { width: 12px; height: 12px; flex: none; }
+  .earlier-head[aria-expanded="true"] .earlier-chevron { transform: rotate(90deg); }
+  .earlier-list { margin-top: 8px; }
+
+  .entry-row { display: flex; align-items: center; gap: 10px; padding: 8px 14px; }
+  .entry-row + .entry-row { border-top: 1px solid var(--border-soft); }
+  .entry-row.open { flex-wrap: wrap; padding: 11px 14px; }
+  .entry-row.open .row-meta { flex: 1; }
+  .row-text {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .row-text.expanded {
+    flex-basis: 100%;
+    white-space: pre-wrap;
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+  }
+  .row-meta { font-size: 12px; color: var(--faint); flex: none; white-space: nowrap; }
+  .row-actions { display: inline-flex; gap: 6px; flex: none; }
+  /* Pointer users get quieter rows: collapsed rows show only "device · time",
+     and the copy buttons fade in over that corner on hover/focus (reserving
+     inline space would leave a dead gap). The hover guard keeps the buttons
+     always visible on touch screens, and .pinned keeps the "Copied ✓" flash
+     visible after the pointer moves on. Expanded rows have room, so their
+     buttons stay put. */
+  @media (hover: hover) and (pointer: fine) {
+    .entry-row { position: relative; }
+    .entry-row:not(.open) .row-actions {
+      position: absolute;
+      top: 50%;
+      right: 9px;
+      transform: translateY(-50%);
+      padding-left: 22px;
+      background: linear-gradient(90deg, rgba(20, 25, 39, 0), var(--panel) 16px);
+      opacity: 0;
+      pointer-events: none;
+    }
+    .entry-row:not(.open):hover .row-actions,
+    .entry-row:not(.open):focus-within .row-actions,
+    .entry-row:not(.open) .row-actions.pinned {
+      opacity: 1;
+      pointer-events: auto;
+    }
+  }
+  .show-all {
+    display: block;
+    width: 100%;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    background: transparent;
+    border: none;
+    border-top: 1px solid var(--border-soft);
+    padding: 9px 14px;
+    cursor: pointer;
+  }
+  .show-all:hover { color: var(--accent); background: var(--bg-raise); }
+  @media (max-width: 520px) {
+    .entry-row:not(.open) .row-meta { display: none; }
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .switch { transition: background 0.15s, border-color 0.15s; }
+    .switch::after { transition: left 0.15s, background 0.15s; }
+    .pill, .btn, .joined-chip { transition: color 0.13s, background 0.13s, border-color 0.13s; }
+    .share-card { transition: border-color 0.15s; }
+    @keyframes dot-pulse {
+      0% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.45); }
+      100% { box-shadow: 0 0 0 9px rgba(74, 222, 128, 0); }
+    }
+    .dot.connected { animation: dot-pulse 1.4s ease-out 2; }
+    @keyframes entry-in {
+      from { opacity: 0; transform: translateY(-7px); }
+      to { opacity: 1; transform: none; }
+    }
+    .entry-new { animation: entry-in 0.35s ease; }
+    .earlier-chevron { transition: transform 0.15s; }
+    .row-actions { transition: opacity 0.12s; }
+    /* The hero element is stable across morphs, so a fresh entry lands as a
+       content swap; this ring-and-settle makes the handoff legible. */
+    @keyframes hero-in {
+      from {
+        opacity: 0.3;
+        transform: translateY(-4px);
+        box-shadow: 0 0 0 6px rgba(124, 140, 255, 0.2);
+      }
+    }
+    .hero-card.entry-new { animation: hero-in 0.45s ease; }
+    @keyframes bar-blink { 50% { opacity: 0.55; } }
+    #reconnect { animation: bar-blink 1.6s ease-in-out infinite; }
+  }
+</style>
+</head>
+<body>
+<div id="reconnect" role="status" hidden>reconnecting&hellip;</div>
+<main>
+  <header>
+    <a class="wordmark" href="/" aria-label="yoink — devices view">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M13 7l-3 5h4l-3 5"/></svg>
+      yoink
+    </a>
+    <span class="device-chip" id="device-name" title="This device's name on the network"></span>
+    <span class="spacer"></span>
+    <span id="clip-warn" class="chip warn" hidden title="yoink can't reach an OS clipboard here; sharing and browser copy still work">clipboard unavailable</span>
+    <label class="toggle-label" id="auto-apply-label" title="Automatically put entries received from your other devices on this device's clipboard">
+      Auto-apply
+      <input type="checkbox" class="switch" id="auto-apply">
+    </label>
+  </header>
+
+  <nav id="nav" aria-label="Spaces"></nav>
+
+  <div id="view"></div>
+
+  <section id="sec-share">
+    <h2 id="share-heading">Share</h2>
+    <div class="card share-card">
+      <textarea id="share-text" rows="3"></textarea>
+      <div class="share-actions">
+        <span class="hint"><kbd>Ctrl/⌘ Enter</kbd> to send &middot; <kbd>/</kbd> to focus</span>
+        <button class="btn primary" id="share-btn">Yoink it</button>
+      </div>
+    </div>
+  </section>
+
+  <div id="entries">
+    <section><div class="card"><div class="empty">Waiting for yoink&hellip;</div></div></section>
+  </div>
+</main>
+<script src="/assets/idiomorph.js"></script>
+<script>
+"use strict";
+
+/* The scope is fixed per page: "/" is the devices view, "/r/{name}" a room
+   view (the server only ever serves this page under canonical room names). */
+const SCOPE = (() => {
+  const m = location.pathname.match(/^\/r\/([a-z0-9-]+)$/);
+  return m ? { kind: "room", name: m[1] } : { kind: "devices" };
+})();
+const SCOPE_STR = SCOPE.kind === "room" ? "room:" + SCOPE.name : "devices";
+
+let state = null;
+let firstRender = true;
+let backoff = 1000;
+let newRoomOpen = false;
+let newRoomDraft = "";
+/* Transient UI state survives pushes because rendering is a pure function of
+   `state` + these maps; idiomorph then morphs the DOM in place. */
+const expanded = new Set();        // entry ids shown un-clamped
+const flashes = new Map();         // "{entryId}:{kind}" -> flash label
+const seenEntries = new Set();     // entry ids already rendered once
+let earlierOpen = false;           // "Earlier" disclosure on the devices view
+let earlierShowAll = false;        // earlier list uncapped after "show all"
+let prevHeroId = null;             // last rendered hero entry, to animate its demotion
+const EARLIER_PREVIEW = 15;        // earlier rows shown before "show all"
+
+const navEl = document.getElementById("nav");
+const viewEl = document.getElementById("view");
+const entriesEl = document.getElementById("entries");
+const shareText = document.getElementById("share-text");
+
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+/* Mirror of the server's sanitize_room_name, for the live "+ room" preview. */
+function sanitizeRoom(input) {
+  let out = "";
+  let lastHyphen = true;
+  for (const c of input.trim()) {
+    if (/^[a-zA-Z0-9]$/.test(c)) { out += c.toLowerCase(); lastHyphen = false; }
+    else if (!lastHyphen) { out += "-"; lastHyphen = true; }
+    if (out.length >= 48) break;
+  }
+  out = out.replace(/^-+|-+$/g, "");
+  return out || null;
+}
+
+function relTime(ms) {
+  const diff = Date.now() - ms;
+  if (diff < 45000) return "just now";
+  const mins = Math.max(1, Math.floor(diff / 60000));
+  if (mins < 60) return mins + "m ago";
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + "h ago";
+  return Math.floor(hours / 24) + "d ago";
+}
+
+function post(cmd) {
+  return fetch("/api/command", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(cmd),
+  });
+}
+
+function morph(el, html) {
+  Idiomorph.morph(el, html, { morphStyle: "innerHTML" });
+}
+
+function navHtml() {
+  const joined = new Set(state.rooms.joined);
+  if (SCOPE.kind === "room") joined.add(SCOPE.name); // visiting is joining
+  let html = `<a class="pill ${SCOPE.kind === "devices" ? "active" : ""}" id="nav-devices" href="/">Devices</a>`;
+  for (const name of [...joined].sort()) {
+    const active = SCOPE.kind === "room" && SCOPE.name === name;
+    html += `<a class="pill ${active ? "active" : ""}" id="nav-room-${esc(name)}" href="/r/${esc(name)}"><span class="pill-hash">#</span>${esc(name)}</a>`;
+  }
+  if (newRoomOpen) {
+    html += `<span class="pill pill-input" id="nav-new-room"><span class="pill-hash">#</span><input id="new-room-input" value="${esc(newRoomDraft)}" placeholder="room-name" spellcheck="false" autocomplete="off" maxlength="64" aria-label="New room name"></span>` +
+      `<span class="pill-preview" id="new-room-preview">${esc(newRoomPreview())}</span>`;
+  } else {
+    html += `<button class="pill pill-new" id="nav-add-room" data-action="open-new-room" title="Open a room by name — anyone on this network can join it">+ room</button>`;
+  }
+  return html;
+}
+
+function newRoomPreview() {
+  const name = sanitizeRoom(newRoomDraft || "");
+  return name ? "↵ opens /r/" + name : "";
+}
+
+function peerRow(peer) {
+  const status = peer.connected ? "connected" : peer.online ? "online" : "offline";
+  return `<div class="row" id="peer-${esc(peer.id)}">
+    <span class="dot ${status}"></span>
+    <div class="grow"><div class="peer-name" title="${esc(peer.id)}">${esc(peer.name)}</div></div>
+    <span class="peer-status">${status}</span>
+    <label class="toggle-label" title="Share your clipboard with this device (it has to allow you back)">Share
+      <input type="checkbox" class="switch" data-action="set-allowed" data-id="${esc(peer.id)}"${peer.allowed ? " checked" : ""}>
+    </label>
+  </div>`;
+}
+
+function roomRow(room) {
+  const joined = state.rooms.joined.includes(room.name);
+  const count = room.devices === 1 ? "1 device" : room.devices + " devices";
+  const action = joined
+    ? `<a class="joined-chip" href="/r/${esc(room.name)}" title="You're in this room — open it">&#10003; joined</a>`
+    : `<a class="btn small" href="/r/${esc(room.name)}" title="Join #${esc(room.name)}">Join</a>`;
+  return `<div class="row" id="room-${esc(room.name)}">
+    <span class="room-hash">#</span>
+    <div class="grow"><span class="room-name">${esc(room.name)}</span></div>
+    <span class="room-count">${count}</span>
+    ${action}
+  </div>`;
+}
+
+function devicesViewHtml() {
+  const peers = state.peers.map(peerRow).join("");
+  const rooms = state.rooms.network.map(roomRow).join("");
+  return `<section id="sec-devices">
+    <h2>Devices</h2>
+    <div class="card">${peers || `<div class="empty">No other devices yet. Run yoink on another machine on this network and it shows up here.</div>`}</div>
+  </section>
+  <section id="sec-rooms">
+    <h2>Rooms on this network</h2>
+    <div class="card">${rooms || `<div class="empty">No rooms yet. Hit &ldquo;+ room&rdquo; above to open one &mdash; anyone nearby can join.</div>`}</div>
+  </section>`;
+}
+
+function roomViewHtml() {
+  const members = state.members.map((m) => {
+    const cls = m.connected ? "connected" : "online";
+    const title = m.connected ? "Connected to this room" : "On this network, advertising this room";
+    return `<span class="member-chip" id="member-${esc(m.id)}" title="${title}"><span class="dot mini ${cls}"></span>${esc(m.name)}</span>`;
+  }).join("");
+  return `<section class="room-head" id="sec-room">
+    <div class="room-title-row">
+      <h2 class="room-title"><span class="room-hash">#</span>${esc(SCOPE.name)}</h2>
+      <button class="btn quiet" data-action="leave-room" title="Leave this room on this device; it keeps living wherever someone still has it open">Leave room</button>
+    </div>
+    <div class="member-chips">${members || `<span class="member-hint">Just you in here so far. Tell someone the room name &mdash; visiting the URL is joining.</span>`}</div>
+  </section>`;
+}
+
+function copyButtons(entry, size) {
+  const osKey = entry.id + ":os";
+  const osFlash = flashes.get(osKey);
+  const clipboardOk = state.settings.clipboard_available;
+  let html = "";
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    const bKey = entry.id + ":browser";
+    const bFlash = flashes.get(bKey);
+    html += `<button class="btn${size}${bFlash ? " flash" : ""}" data-action="copy-browser" data-id="${esc(entry.id)}"${bFlash ? " disabled" : ""} title="Copy with this browser's clipboard">${bFlash ? esc(bFlash) : "Copy in browser"}</button>`;
+  }
+  const osTitle = clipboardOk
+    ? "Put this on this device's clipboard"
+    : "This device has no reachable OS clipboard";
+  html += `<button class="btn${size} primary${osFlash ? " flash" : ""}" data-action="copy-os" data-id="${esc(entry.id)}"${osFlash || !clipboardOk ? " disabled" : ""} title="${osTitle}">${osFlash ? esc(osFlash) : "Copy"}</button>`;
+  return html;
+}
+
+function entryFoot(entry, size) {
+  return `<div class="entry-foot">
+    <span class="entry-meta"><span class="entry-device">${esc(entry.device_name)}</span> &middot; ${relTime(entry.created_at_ms)}</span>
+    ${copyButtons(entry, size)}
+  </div>`;
+}
+
+function entryArticle(entry) {
+  const isNew = !firstRender && !seenEntries.has(entry.id);
+  const isExpanded = expanded.has(entry.id);
+  return `<article class="entry${isNew ? " entry-new" : ""}" id="entry-${esc(entry.id)}">
+    <p class="entry-text${isExpanded ? " expanded" : ""}" data-action="expand" data-id="${esc(entry.id)}" title="Click to ${isExpanded ? "collapse" : "expand"}">${esc(entry.text)}</p>
+    ${entryFoot(entry, " small")}
+  </article>`;
+}
+
+/* The hero keeps a fixed element id on purpose: when a fresh entry arrives,
+   idiomorph swaps its content in place instead of replacing the card, so the
+   page doesn't jump and the hero-in animation reads as a handoff. */
+function heroHtml(entry) {
+  const isNew = !firstRender && !seenEntries.has(entry.id);
+  const isExpanded = expanded.has(entry.id);
+  return `<article class="hero-card${isNew ? " entry-new" : ""}" id="hero-card">
+    <p class="hero-text${isExpanded ? " expanded" : ""}" data-action="expand" data-id="${esc(entry.id)}" title="Click to ${isExpanded ? "collapse" : "expand"}">${esc(entry.text)}</p>
+    ${entryFoot(entry, "")}
+  </article>`;
+}
+
+function entryRow(entry, demoted) {
+  const isExpanded = expanded.has(entry.id);
+  // The flash must stay visible even though row buttons are hover-only.
+  const pinned = flashes.has(entry.id + ":os") || flashes.has(entry.id + ":browser");
+  // Collapsed rows are one-liners; newlines and runs of spaces would read as
+  // odd gaps, so condense them until the row is expanded.
+  const text = isExpanded ? entry.text : entry.text.replace(/\s+/g, " ").trim();
+  return `<div class="entry-row${isExpanded ? " open" : ""}${demoted ? " entry-new" : ""}" id="entry-${esc(entry.id)}">
+    <p class="row-text${isExpanded ? " expanded" : ""}" data-action="expand" data-id="${esc(entry.id)}" title="Click to ${isExpanded ? "collapse" : "expand"}">${esc(text)}</p>
+    <span class="row-meta"><span class="entry-device">${esc(entry.device_name)}</span> &middot; ${relTime(entry.created_at_ms)}</span>
+    <span class="row-actions${pinned ? " pinned" : ""}">${copyButtons(entry, " small")}</span>
+  </div>`;
+}
+
+function earlierHtml(rest, demotedId) {
+  const shown = earlierShowAll ? rest : rest.slice(0, EARLIER_PREVIEW);
+  const chevron = `<svg class="earlier-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>`;
+  // The list is rendered even while collapsed (just [hidden]) so that
+  // aria-controls always resolves and toggling is a single attribute flip
+  // for idiomorph instead of a rebuild.
+  let html = `<div class="earlier">
+    <button class="earlier-head" id="earlier-toggle" data-action="toggle-earlier" aria-expanded="${earlierOpen}" aria-controls="earlier-list" title="Everything that came before the current entry">${chevron}Earlier &middot; ${rest.length} item${rest.length === 1 ? "" : "s"}</button>
+    <div class="card earlier-list" id="earlier-list"${earlierOpen ? "" : " hidden"}>`
+    + shown.map((e) => entryRow(e, e.id === demotedId)).join("");
+  if (rest.length > shown.length) {
+    html += `<button class="show-all" data-action="show-all-earlier">Show all ${rest.length} items</button>`;
+  }
+  return html + `</div></div>`;
+}
+
+function devicesEntriesHtml() {
+  let html = `<section id="sec-clip"><h2>Current clipboard</h2>`;
+  if (state.entries.length === 0) {
+    return html + `<div class="card"><div class="empty">Nothing yoinked yet. Share something above, or copy text on a paired device.</div></div></section>`;
+  }
+  const current = state.entries[0];
+  html += heroHtml(current);
+  const rest = state.entries.slice(1);
+  if (rest.length > 0) {
+    const demotedId = prevHeroId && prevHeroId !== current.id ? prevHeroId : null;
+    html += earlierHtml(rest, demotedId);
+  }
+  return html + `</section>`;
+}
+
+function entriesHtml() {
+  if (SCOPE.kind === "devices") return devicesEntriesHtml();
+  if (state.entries.length === 0) {
+    return `<section id="sec-feed"><div class="card"><div class="empty">Nothing in #${esc(SCOPE.name)} yet. Drop something in the box above.</div></div></section>`;
+  }
+  return `<section id="sec-feed"><div class="card">${state.entries.map(entryArticle).join("")}</div></section>`;
+}
+
+function render() {
+  if (!state) return;
+  document.getElementById("device-name").textContent = state.device.name;
+  document.getElementById("clip-warn").hidden = state.settings.clipboard_available;
+  const auto = document.getElementById("auto-apply");
+  auto.checked = state.settings.auto_apply;
+  auto.disabled = !state.settings.clipboard_available;
+  morph(navEl, navHtml());
+  morph(viewEl, SCOPE.kind === "room" ? roomViewHtml() : devicesViewHtml());
+  morph(entriesEl, entriesHtml());
+  for (const entry of state.entries) seenEntries.add(entry.id);
+  if (state.entries.length > 0) prevHeroId = state.entries[0].id;
+  firstRender = false;
+}
+
+/* Entry point for pushes — and for driving the UI with fixture state. */
+function applyState(next) {
+  state = next;
+  render();
+}
+
+function flash(key, label) {
+  flashes.set(key, label);
+  render();
+  setTimeout(() => {
+    flashes.delete(key);
+    render();
+  }, 1200);
+}
+
+function share() {
+  const text = shareText.value;
+  if (text.trim() === "") return;
+  post({ cmd: "add_entry", text, scope: SCOPE_STR }).then((res) => {
+    if (res.ok) {
+      shareText.value = "";
+      autoGrow();
+      shareText.focus();
+    }
+  }).catch(() => {});
+}
+
+function autoGrow() {
+  shareText.style.height = "auto";
+  shareText.style.height = Math.min(shareText.scrollHeight + 2, window.innerHeight * 0.4) + "px";
+}
+
+function closeNewRoom() {
+  newRoomOpen = false;
+  newRoomDraft = "";
+  render();
+}
+
+document.addEventListener("click", (ev) => {
+  const el = ev.target.closest("[data-action]");
+  if (!el) return;
+  switch (el.dataset.action) {
+    case "expand": {
+      if (String(window.getSelection()) !== "") return; // selecting, not toggling
+      const id = el.dataset.id;
+      if (!expanded.delete(id)) expanded.add(id);
+      render();
+      break;
+    }
+    case "copy-os":
+      post({ cmd: "copy_entry", id: el.dataset.id, scope: SCOPE_STR });
+      flash(el.dataset.id + ":os", "Copied ✓");
+      break;
+    case "copy-browser": {
+      const entry = (state ? state.entries : []).find((e) => e.id === el.dataset.id);
+      if (!entry) return;
+      navigator.clipboard.writeText(entry.text).then(
+        () => flash(el.dataset.id + ":browser", "Copied ✓"),
+        () => flash(el.dataset.id + ":browser", "Couldn't copy"),
+      );
+      break;
+    }
+    case "leave-room":
+      post({ cmd: "leave_room", name: SCOPE.name }).finally(() => {
+        location.href = "/";
+      });
+      break;
+    case "open-new-room": {
+      newRoomOpen = true;
+      render();
+      const input = document.getElementById("new-room-input");
+      if (input) input.focus();
+      break;
+    }
+    case "toggle-earlier":
+      earlierOpen = !earlierOpen;
+      render();
+      break;
+    case "show-all-earlier":
+      earlierShowAll = true;
+      render();
+      break;
+  }
+});
+
+document.addEventListener("change", (ev) => {
+  const el = ev.target;
+  if (el.dataset && el.dataset.action === "set-allowed") {
+    post({ cmd: "set_allowed", device_id: el.dataset.id, allowed: el.checked });
+  } else if (el.id === "auto-apply") {
+    post({ cmd: "set_auto_apply", enabled: el.checked });
+  }
+});
+
+document.addEventListener("input", (ev) => {
+  if (ev.target.id === "new-room-input") {
+    newRoomDraft = ev.target.value;
+    const preview = document.getElementById("new-room-preview");
+    if (preview) preview.textContent = newRoomPreview();
+  } else if (ev.target === shareText) {
+    autoGrow();
+  }
+});
+
+document.addEventListener("focusout", (ev) => {
+  if (ev.target.id === "new-room-input" && newRoomDraft.trim() === "") closeNewRoom();
+});
+
+document.addEventListener("keydown", (ev) => {
+  if (ev.target.id === "new-room-input") {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      const name = sanitizeRoom(newRoomDraft);
+      if (name) location.href = "/r/" + name;
+    } else if (ev.key === "Escape") {
+      closeNewRoom();
+    }
+    return;
+  }
+  if (ev.target === shareText) {
+    if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+      ev.preventDefault();
+      share();
+    } else if (ev.key === "Escape") {
+      shareText.blur(); // step out; a second Esc then collapses entries
+    }
+    return;
+  }
+  const typing = /^(INPUT|TEXTAREA)$/.test((document.activeElement || {}).tagName || "");
+  if (ev.key === "/" && !typing && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+    ev.preventDefault();
+    shareText.focus();
+  } else if (ev.key === "Escape" && expanded.size > 0) {
+    expanded.clear();
+    render();
+  }
+});
+
+document.getElementById("share-btn").addEventListener("click", share);
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws/ui?scope=${encodeURIComponent(SCOPE_STR)}`);
+  ws.onopen = () => {
+    backoff = 1000;
+    document.getElementById("reconnect").hidden = true;
+  };
+  ws.onmessage = (ev) => {
+    let next;
+    try { next = JSON.parse(ev.data); } catch { return; }
+    applyState(next);
+  };
+  ws.onerror = () => ws.close();
+  ws.onclose = () => {
+    document.getElementById("reconnect").hidden = false;
+    setTimeout(connect, backoff);
+    backoff = Math.min(backoff * 2, 10000);
+  };
+}
+
+/* Relative times drift; refresh them (cheap — idiomorph only touches changed
+   text nodes). */
+setInterval(render, 30000);
+
+(async function boot() {
+  if (SCOPE.kind === "room") {
+    document.title = "yoink — #" + SCOPE.name;
+    document.getElementById("share-heading").textContent = "Share to #" + SCOPE.name;
+    shareText.placeholder = "Type or paste something to drop into #" + SCOPE.name + "…";
+    // The OS clipboard never feeds rooms, so auto-apply has no meaning here.
+    document.getElementById("auto-apply-label").hidden = true;
+    // Visiting is joining: idempotent, and it creates the room when needed.
+    try { await post({ cmd: "join_room", name: SCOPE.name }); } catch {}
+  } else {
+    shareText.placeholder = "Type or paste something to send to your devices…";
+    /* The devices view leads with the clipboard itself: compose box, then the
+       current entry it feeds, with device management below. One-time move
+       before the first render, so idiomorph never sees sections relocate. */
+    const main = document.querySelector("main");
+    main.insertBefore(document.getElementById("sec-share"), viewEl);
+    main.insertBefore(entriesEl, viewEl);
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

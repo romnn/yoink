@@ -1,0 +1,23 @@
+[package]
+name = "yoink-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+yoink-core = { workspace = true }
+yoink-discovery = { workspace = true }
+yoink-sync = { workspace = true }
+
+anyhow = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

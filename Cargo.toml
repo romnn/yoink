@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/romnn/yoink"
+
+[workspace.dependencies]
+yoink-core = { path = "crates/yoink-core" }
+yoink-discovery = { path = "crates/yoink-discovery" }
+yoink-clipboard = { path = "crates/yoink-clipboard" }
+yoink-sync = { path = "crates/yoink-sync" }
+yoink-server = { path = "crates/yoink-server" }
+
+anyhow = "1.0.102"
+arboard = "3.6.1"
+axum = { version = "0.8.9", features = ["ws"] }
+clap = { version = "4.6.1", features = ["derive"] }
+directories = "6.0.0"
+futures-util = "0.3.32"
+gethostname = "1.1.0"
+mdns-sd = "0.20.0"
+open = "5.3.5"
+parking_lot = "0.12.5"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+# The version tokio already pulls in; used directly only for IPV6_V6ONLY,
+# which tokio's TcpSocket does not expose.
+socket2 = "0.6.4"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-tungstenite = "0.29.0"
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.23.3", features = ["v4", "serde"] }
+# The `sync` feature swaps yrs' Rc-based internals for Arc so Doc and
+# Subscription are Send + Sync — required everywhere ClipDoc crosses task
+# boundaries (sync manager, axum state, app loop spawns).
+yrs = { version = "0.27.0", features = ["sync"] }
