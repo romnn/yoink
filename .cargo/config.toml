@@ -1,0 +1,10 @@
+[alias]
+c   = 'check --workspace --all-targets'
+
+# linting
+l = "clippy"
+lint = "clippy"
+fixit = "clippy --fix --allow-dirty --all-targets --no-deps"
+
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }

@@ -8,6 +8,34 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/romnn/yoink"
 
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+debug = 0
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+todo = "deny"
+indexing_slicing = "deny"
+
+# Allowed
+map_unwrap_or = "allow"
+assigning_clones = "allow"
+struct_excessive_bools = "allow"
+
 [workspace.dependencies]
 yoink-core = { path = "crates/yoink-core" }
 yoink-discovery = { path = "crates/yoink-discovery" }
