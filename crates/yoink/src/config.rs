@@ -195,7 +195,7 @@ mod tests {
     fn sanitize_rooms_drops_dupes_and_junk() {
         let rooms: Vec<String> = ["standup", "My Room", "standup", "!!!", "attic"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
         assert_eq!(
             sanitize_rooms(&rooms),

@@ -30,7 +30,7 @@ const RESERVED_PATHS: &[&str] = &["api", "ws", "sync", "r", "assets", "favicon.i
 /// Cap for incoming WebSocket messages and frames on both upgrade routes.
 /// `/sync` is reachable from the LAN before any handshake validation, so
 /// without a cap a stranger could make us buffer arbitrarily large frames;
-/// 8 MiB comfortably fits a full-history SYNC_STEP_2 while bounding pre-auth
+/// 8 MiB comfortably fits a full-history `SYNC_STEP_2` while bounding pre-auth
 /// memory use.
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -218,8 +218,12 @@ mod tests {
             id: "dev-self".into(),
             name: "my-laptop".into(),
         };
-        let (sync, _events) =
-            SyncManager::new(docs.clone(), device.clone(), HashSet::new(), HashSet::new());
+        let (sync, _events) = SyncManager::new(
+            docs.clone(),
+            device.clone(),
+            HashSet::new(),
+            &HashSet::new(),
+        );
         let (commands, _commands_rx) = mpsc::channel(8);
         let (notify, _) = broadcast::channel(8);
         let ctx = ServerCtx {

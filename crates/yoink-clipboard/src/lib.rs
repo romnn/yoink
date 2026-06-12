@@ -17,6 +17,10 @@ use tokio::sync::mpsc;
 /// blocking the clipboard thread.
 const EVENT_CHANNEL_CAPACITY: usize = 32;
 
+/// Something the worker observed happening to the local OS clipboard, emitted
+/// on the receiver returned by [`ClipboardHandle::spawn`]. Text the handle
+/// wrote itself via [`ClipboardHandle::set_text`] is suppressed and never
+/// surfaces here, so every event reflects a genuine local user action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardEvent {
     /// The user copied new text into the OS clipboard.
@@ -66,12 +70,12 @@ impl ClipboardHandle {
             .name("yoink-clipboard".to_owned())
             .spawn(move || {
                 worker::run(
-                    cmd_rx,
-                    worker_event_tx,
-                    init_tx,
+                    &cmd_rx,
+                    &worker_event_tx,
+                    &init_tx,
                     poll_interval,
-                    worker_available,
-                )
+                    &worker_available,
+                );
             });
 
         let initially_available = match spawned {
@@ -99,6 +103,7 @@ impl ClipboardHandle {
     /// Whether an OS clipboard is actually reachable *right now*. Starts out
     /// reflecting the worker's init result and flips to false for good if
     /// the worker thread ever exits.
+    #[must_use]
     pub fn available(&self) -> bool {
         self.available.load(Ordering::Relaxed)
     }

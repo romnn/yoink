@@ -73,16 +73,26 @@ use yoink_core::{AppCommand, DeviceInfo, DocSet};
 use yoink_discovery::PeerInfo;
 use yoink_sync::SyncManager;
 
+/// UI-visible slice of the app's runtime configuration. A snapshot the app
+/// loop keeps in sync; the server only reads it to fill `settings` in the
+/// state JSON.
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// Whether incoming personal-clipboard entries are written to the OS
+    /// clipboard automatically (the user's `SetAutoApply` choice).
     pub auto_apply: bool,
+    /// Whether an OS clipboard backend was found at startup; when `false` the
+    /// UI hides clipboard-dependent affordances rather than failing silently.
     pub clipboard_available: bool,
 }
 
 /// A peer as the UI should see it (registry maintained by the app loop).
 #[derive(Debug, Clone)]
 pub struct PeerView {
+    /// Last-known discovery announcement for the peer (identity, name, rooms).
     pub info: PeerInfo,
+    /// Whether the peer is currently advertising on the network. Kept distinct
+    /// from removal so an allowed-but-offline peer can still be revoked.
     pub online: bool,
 }
 
@@ -90,21 +100,35 @@ pub struct PeerView {
 /// state and enqueues [`AppCommand`]s; all mutation happens in the app loop.
 #[derive(Clone)]
 pub struct ServerCtx {
+    /// This instance's own identity, rendered as `device` in the state JSON.
     pub device: DeviceInfo,
+    /// All scoped documents; read to build the `entries` history per scope.
     pub docs: Arc<DocSet>,
+    /// Peer sync engine: serves `/sync` inbound connections and reports
+    /// per-scope live connectivity and the personal-clipboard allowlist.
     pub sync: Arc<SyncManager>,
+    /// Discovered/allowed peer registry keyed by device id, maintained by the
+    /// app loop; the union the devices view renders.
     pub peers: Arc<parking_lot::RwLock<HashMap<String, PeerView>>>,
+    /// UI-visible settings snapshot, kept current by the app loop.
     pub settings: Arc<parking_lot::RwLock<Settings>>,
     /// Names of the rooms this instance currently has open; a mirror
     /// maintained by the app loop (the source of truth lives in the sync
     /// manager and the doc set, which the server must not mutate).
     pub joined_rooms: Arc<parking_lot::RwLock<BTreeSet<String>>>,
+    /// Channel the handlers enqueue [`AppCommand`]s on; the app loop is the
+    /// sole consumer and the only place state actually mutates.
     pub commands: mpsc::Sender<AppCommand>,
     /// App loop sends `()` whenever any UI-visible state changed.
     pub notify: broadcast::Sender<()>,
 }
 
 /// Serve until the listener fails or the task is cancelled.
+///
+/// # Errors
+///
+/// Propagates the error from [`axum::serve`] if accepting connections fails
+/// (e.g. the listening socket is closed out from under it).
 pub async fn serve(listener: tokio::net::TcpListener, ctx: ServerCtx) -> anyhow::Result<()> {
     let app = routes::router(ctx);
     // Connect info is what lets the loopback guard tell local browsers apart

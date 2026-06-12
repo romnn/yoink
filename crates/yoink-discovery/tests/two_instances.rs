@@ -10,24 +10,34 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use yoink_discovery::{Discovery, DiscoveryEvent, PeerInfo};
 
-async fn wait_for_found(rx: &mut mpsc::Receiver<DiscoveryEvent>, device_id: &str) -> PeerInfo {
-    loop {
-        match rx.recv().await {
-            Some(DiscoveryEvent::Found(peer)) if peer.device_id == device_id => return peer,
-            Some(_) => continue,
-            None => panic!("discovery channel closed before finding {device_id}"),
+/// Drains discovery events until `device_id` is found. Returns `None` if the
+/// channel closes first (the daemon stopped), letting the calling test fail
+/// with a panic in test context rather than panicking inside this helper.
+async fn wait_for_found(
+    rx: &mut mpsc::Receiver<DiscoveryEvent>,
+    device_id: &str,
+) -> Option<PeerInfo> {
+    while let Some(event) = rx.recv().await {
+        if let DiscoveryEvent::Found(peer) = event
+            && peer.device_id == device_id
+        {
+            return Some(peer);
         }
     }
+    None
 }
 
-async fn wait_for_lost(rx: &mut mpsc::Receiver<DiscoveryEvent>, expected: &str) {
-    loop {
-        match rx.recv().await {
-            Some(DiscoveryEvent::Lost { device_id }) if device_id == expected => return,
-            Some(_) => continue,
-            None => panic!("discovery channel closed before losing {expected}"),
+/// Drains discovery events until `expected` is reported lost. Returns `false`
+/// if the channel closes first, so the calling test can panic in test context.
+async fn wait_for_lost(rx: &mut mpsc::Receiver<DiscoveryEvent>, expected: &str) -> bool {
+    while let Some(event) = rx.recv().await {
+        if let DiscoveryEvent::Lost { device_id } = event
+            && device_id == expected
+        {
+            return true;
         }
     }
+    false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -41,10 +51,12 @@ async fn two_instances_discover_each_other() {
     let deadline = Duration::from_secs(10);
     let found_b = timeout(deadline, wait_for_found(&mut rx_a, "itest-bbbb-2222"))
         .await
-        .expect("instance a did not discover instance b in time");
+        .expect("instance a did not discover instance b in time")
+        .expect("instance a's discovery channel closed before finding b");
     let found_a = timeout(deadline, wait_for_found(&mut rx_b, "itest-aaaa-1111"))
         .await
-        .expect("instance b did not discover instance a in time");
+        .expect("instance b did not discover instance a in time")
+        .expect("instance b's discovery channel closed before finding a");
 
     assert_eq!(found_b.name, "yoink-itest-b");
     assert_eq!(found_b.port, 49302);
@@ -64,8 +76,12 @@ async fn two_instances_discover_each_other() {
     // packets must already be on the wire when it returns — observable as a
     // prompt Lost event on the other instance rather than a TTL expiry.
     disco_a.shutdown();
-    timeout(deadline, wait_for_lost(&mut rx_b, "itest-aaaa-1111"))
+    let observed_lost = timeout(deadline, wait_for_lost(&mut rx_b, "itest-aaaa-1111"))
         .await
         .expect("instance b did not observe instance a's goodbye in time");
+    assert!(
+        observed_lost,
+        "instance b's discovery channel closed before observing a's goodbye"
+    );
     disco_b.shutdown();
 }

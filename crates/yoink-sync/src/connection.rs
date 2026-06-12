@@ -23,6 +23,13 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// detected.
 struct Hangup;
 
+/// The HELLO exchange did not complete. `close` is false only when our own
+/// send already failed (the socket is dead), so attempting a polite close
+/// would just stall against a broken socket.
+struct HandshakeFailed {
+    close: bool,
+}
+
 /// How a connection ended, from the dialer's perspective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionOutcome {
@@ -45,6 +52,74 @@ struct Registered<'a> {
 }
 
 impl SyncManager {
+    /// Exchange HELLOs and return the peer's. The dialing side leads with its
+    /// HELLO so the accepting side learns the requested scope; the accepting
+    /// side answers by echoing the scope back. Either way our HELLO goes out
+    /// before the peer's is validated: HELLO carries no document data, and a
+    /// refused dialer relies on seeing HELLO-then-close (rather than silence)
+    /// from us.
+    ///
+    /// `dialed_scope` is `Some` for a dialed socket (the scope it set out to
+    /// sync) and `None` for an inbound one, whose scope comes from the peer's
+    /// HELLO.
+    async fn handshake(
+        &self,
+        socket: &mut PeerSocket,
+        dialed_scope: Option<&Scope>,
+    ) -> Result<Hello, HandshakeFailed> {
+        if let Some(scope) = dialed_scope {
+            let hello = self.hello_frame(scope.clone());
+            if socket.send(hello).await.is_err() {
+                return Err(HandshakeFailed { close: false });
+            }
+            await_hello(socket)
+                .await
+                .ok_or(HandshakeFailed { close: true })
+        } else {
+            let peer = await_hello(socket)
+                .await
+                .ok_or(HandshakeFailed { close: true })?;
+            let hello = self.hello_frame(peer.scope.clone());
+            if socket.send(hello).await.is_err() {
+                return Err(HandshakeFailed { close: true });
+            }
+            Ok(peer)
+        }
+    }
+
+    /// Reject a peer whose HELLO fails the pre-registration checks: a
+    /// mismatched protocol version (v1 peers, whose HELLO has no scope and
+    /// decodes as `Devices`, are refused here before any document data flows),
+    /// our own id looping back, or — for a dialed socket — a scope other than
+    /// the one we dialed. Logging only; the caller closes the socket on `Err`.
+    fn validate_peer(&self, peer: &Hello, dialed_scope: Option<&Scope>) -> Result<(), ()> {
+        if peer.proto != PROTOCOL_VERSION {
+            tracing::warn!(
+                peer = %peer.device_id,
+                peer_proto = peer.proto,
+                our_proto = PROTOCOL_VERSION,
+                "protocol version mismatch; refusing to sync"
+            );
+            return Err(());
+        }
+        if peer.device_id == self.device.id {
+            tracing::debug!("connected to ourselves; closing");
+            return Err(());
+        }
+        if let Some(scope) = dialed_scope
+            && *scope != peer.scope
+        {
+            tracing::warn!(
+                peer = %peer.device_id,
+                dialed = %scope,
+                answered = %peer.scope,
+                "peer answered with a different scope; refusing"
+            );
+            return Err(());
+        }
+        Ok(())
+    }
+
     /// `dialed_scope` is the scope a dial loop set out to sync (None for
     /// inbound sockets, whose scope is learned from the peer's HELLO).
     /// `owning_dialer` is the generation of the dial loop driving this
@@ -56,65 +131,17 @@ impl SyncManager {
         dialed_scope: Option<Scope>,
         owning_dialer: Option<u64>,
     ) -> ConnectionOutcome {
-        // The dialing side leads with its HELLO so the accepting side learns
-        // the requested scope; the accepting side answers by echoing the
-        // scope back. Either way our HELLO goes out before the peer's is
-        // validated: HELLO carries no document data, and a refused dialer
-        // relies on seeing HELLO-then-close (rather than silence) from us.
-        let peer = match &dialed_scope {
-            Some(scope) => {
-                let hello = self.hello_frame(scope.clone());
-                if socket.send(hello).await.is_err() {
-                    return ConnectionOutcome::Failed;
-                }
-                match await_hello(&mut socket).await {
-                    Some(peer) => peer,
-                    None => {
-                        close_socket(socket).await;
-                        return ConnectionOutcome::Failed;
-                    }
-                }
-            }
-            None => {
-                let Some(peer) = await_hello(&mut socket).await else {
+        let peer = match self.handshake(&mut socket, dialed_scope.as_ref()).await {
+            Ok(peer) => peer,
+            Err(HandshakeFailed { close }) => {
+                if close {
                     close_socket(socket).await;
-                    return ConnectionOutcome::Failed;
-                };
-                let hello = self.hello_frame(peer.scope.clone());
-                if socket.send(hello).await.is_err() {
-                    close_socket(socket).await;
-                    return ConnectionOutcome::Failed;
                 }
-                peer
+                return ConnectionOutcome::Failed;
             }
         };
 
-        if peer.proto != PROTOCOL_VERSION {
-            // v1 peers land here: their HELLO carries no scope (decoded as
-            // `Devices`) and is refused before any document data flows.
-            tracing::warn!(
-                peer = %peer.device_id,
-                peer_proto = peer.proto,
-                our_proto = PROTOCOL_VERSION,
-                "protocol version mismatch; refusing to sync"
-            );
-            close_socket(socket).await;
-            return ConnectionOutcome::Failed;
-        }
-        if peer.device_id == self.device.id {
-            tracing::debug!("connected to ourselves; closing");
-            close_socket(socket).await;
-            return ConnectionOutcome::Failed;
-        }
-        if let Some(scope) = &dialed_scope
-            && *scope != peer.scope
-        {
-            tracing::warn!(
-                peer = %peer.device_id,
-                dialed = %scope,
-                answered = %peer.scope,
-                "peer answered with a different scope; refusing"
-            );
+        if self.validate_peer(&peer, dialed_scope.as_ref()).is_err() {
             close_socket(socket).await;
             return ConnectionOutcome::Failed;
         }
@@ -241,7 +268,7 @@ impl SyncManager {
         .encode()
     }
 
-    /// Frame loop. Returns whether the peer was announced (PeerConnected
+    /// Frame loop. Returns whether the peer was announced (`PeerConnected`
     /// emitted), which happens on its first valid post-HELLO frame.
     async fn pump(
         &self,
@@ -259,8 +286,8 @@ impl SyncManager {
         ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = hangup_signalled(&mut hangup) => break,
-                _ = tokio::time::sleep_until(last_inbound + conn.keepalive.idle_timeout) => {
+                () = hangup_signalled(&mut hangup) => break,
+                () = tokio::time::sleep_until(last_inbound + conn.keepalive.idle_timeout) => {
                     tracing::info!(peer = %conn.peer.device_id, scope = %conn.peer.scope, "connection silent past keepalive deadline; hanging up");
                     break;
                 }
@@ -309,12 +336,12 @@ impl SyncManager {
         announced
     }
 
-    /// Emit PeerConnected for this connection iff it is still the registered
+    /// Emit `PeerConnected` for this connection iff it is still the registered
     /// one; returns false when the entry is gone or replaced (a de-allow,
     /// room leave or takeover won the race), in which case the caller must
     /// hang up. Emitting under the state lock keeps the event ordered against
     /// removal sites, which read `announced` to decide whether a
-    /// PeerDisconnected is owed (`emit` never blocks, so holding the lock is
+    /// `PeerDisconnected` is owed (`emit` never blocks, so holding the lock is
     /// safe).
     fn try_announce(&self, peer: &Hello, generation: u64) -> bool {
         let key: ConnKey = (peer.device_id.clone(), peer.scope.clone());
@@ -380,7 +407,7 @@ fn handle_frame(doc: &ClipDoc, peer_id: &str, payload: &[u8]) -> Result<Option<V
                 Err(Hangup)
             }
         },
-        Ok(Frame::SyncStep2(update)) | Ok(Frame::Update(update)) => doc
+        Ok(Frame::SyncStep2(update) | Frame::Update(update)) => doc
             .apply_update(&update, Some(peer_id))
             .map(|()| None)
             .map_err(|err| {
@@ -406,7 +433,7 @@ async fn send_or_hangup(
     let mut hangup = hangup.clone();
     tokio::select! {
         biased;
-        _ = hangup_signalled(&mut hangup) => Err(Hangup),
+        () = hangup_signalled(&mut hangup) => Err(Hangup),
         result = async {
             match frame {
                 Some(frame) => socket.send(frame).await,
@@ -436,13 +463,11 @@ async fn close_socket(socket: PeerSocket) {
 /// The peer's HELLO, or `None` when it sent something else, sent nothing
 /// usable, or ran out the handshake clock.
 async fn await_hello(socket: &mut PeerSocket) -> Option<Hello> {
-    match tokio::time::timeout(HELLO_TIMEOUT, recv_hello(socket)).await {
-        Ok(hello) => hello,
-        Err(_) => {
-            tracing::debug!("peer did not send HELLO in time");
-            None
-        }
-    }
+    let Ok(hello) = tokio::time::timeout(HELLO_TIMEOUT, recv_hello(socket)).await else {
+        tracing::debug!("peer did not send HELLO in time");
+        return None;
+    };
+    hello
 }
 
 async fn recv_hello(socket: &mut PeerSocket) -> Option<Hello> {
@@ -461,7 +486,7 @@ async fn recv_hello(socket: &mut PeerSocket) -> Option<Hello> {
                     }
                 };
             }
-            Incoming::Activity => continue,
+            Incoming::Activity => {}
         }
     }
 }

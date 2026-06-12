@@ -1,4 +1,4 @@
-//! End-to-end tests: two full stacks (DocSet + SyncManager + a minimal axum
+//! End-to-end tests: two full stacks (`DocSet` + `SyncManager` + a minimal axum
 //! server exposing `/sync`) on loopback ephemeral ports, discovery simulated
 //! by calling `peer_discovered` directly. A hand-rolled websocket client
 //! speaks the wire protocol directly where a misbehaving peer is needed.
@@ -33,38 +33,45 @@ struct Stack {
     addr: SocketAddr,
 }
 
-async fn stack(id: &str, allowed: &[&str]) -> Stack {
+/// Spin up a full loopback stack. Fallible (the ephemeral-port bind can fail
+/// if the host is exhausted) so the calling test panics in test context — see
+/// the crate-wide convention of keeping `unwrap`/`expect` out of test helpers.
+async fn stack(id: &str, allowed: &[&str]) -> Result<Stack, std::io::Error> {
     stack_with_rooms(id, allowed, &[]).await
 }
 
-async fn stack_with_rooms(id: &str, allowed: &[&str], rooms: &[&str]) -> Stack {
+async fn stack_with_rooms(
+    id: &str,
+    allowed: &[&str],
+    rooms: &[&str],
+) -> Result<Stack, std::io::Error> {
     let docs = Arc::new(DocSet::new());
     let device = DeviceInfo {
         id: id.to_string(),
         name: format!("device-{id}"),
     };
-    let allowed: HashSet<String> = allowed.iter().map(|s| s.to_string()).collect();
-    let joined: HashSet<String> = rooms.iter().map(|s| s.to_string()).collect();
-    let (manager, events) = SyncManager::new(docs.clone(), device.clone(), allowed, joined);
+    let allowed: HashSet<String> = allowed.iter().map(ToString::to_string).collect();
+    let joined: HashSet<String> = rooms.iter().map(ToString::to_string).collect();
+    let (manager, events) = SyncManager::new(docs.clone(), device.clone(), allowed, &joined);
 
     let app = axum::Router::new()
         .route("/sync", axum::routing::any(sync_route))
         .with_state(manager.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
 
-    Stack {
+    Ok(Stack {
         doc: docs.devices(),
         docs,
-        rooms: rooms.iter().map(|s| s.to_string()).collect(),
+        rooms: rooms.iter().map(ToString::to_string).collect(),
         device,
         manager,
         events,
         addr,
-    }
+    })
 }
 
 async fn sync_route(
@@ -111,29 +118,33 @@ async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
     }
 }
 
-/// Receive events until `expected` shows up, panicking on timeout.
+/// Receive events until `expected` shows up. The inner block reports `false`
+/// if the channel closes first, so this fails in test context (an `assert!`,
+/// not a bare `panic!`) on both timeout and closure.
 async fn expect_event(events: &mut mpsc::Receiver<SyncEvent>, expected: SyncEvent) {
     let mut seen = Vec::new();
-    let result = tokio::time::timeout(TIMEOUT, async {
+    let arrived = tokio::time::timeout(TIMEOUT, async {
         loop {
             match events.recv().await {
-                Some(event) if event == expected => return,
+                Some(event) if event == expected => return true,
                 Some(event) => seen.push(event),
-                None => panic!("event channel closed while waiting for {expected:?}"),
+                None => return false,
             }
         }
     })
     .await;
     assert!(
-        result.is_ok(),
-        "timed out waiting for {expected:?}; saw {seen:?}"
+        matches!(arrived, Ok(true)),
+        "did not observe {expected:?} (timeout or channel closed); saw {seen:?}"
     );
 }
 
 /// Receive events until all of `expected` have shown up, in any order —
-/// needed when connections in several scopes race each other.
+/// needed when connections in several scopes race each other. Reports `false`
+/// on channel closure so the assertion (not a bare `panic!`) fires in test
+/// context.
 async fn expect_events(events: &mut mpsc::Receiver<SyncEvent>, mut expected: Vec<SyncEvent>) {
-    let result = tokio::time::timeout(TIMEOUT, async {
+    let arrived = tokio::time::timeout(TIMEOUT, async {
         while !expected.is_empty() {
             match events.recv().await {
                 Some(event) => {
@@ -141,12 +152,16 @@ async fn expect_events(events: &mut mpsc::Receiver<SyncEvent>, mut expected: Vec
                         expected.remove(found);
                     }
                 }
-                None => panic!("event channel closed while waiting for {expected:?}"),
+                None => return false,
             }
         }
+        true
     })
     .await;
-    assert!(result.is_ok(), "timed out; still waiting for {expected:?}");
+    assert!(
+        matches!(arrived, Ok(true)),
+        "did not observe all events (timeout or channel closed); still waiting for {expected:?}"
+    );
 }
 
 fn connect_mutually(a: &Stack, b: &Stack) {
@@ -157,12 +172,13 @@ fn connect_mutually(a: &Stack, b: &Stack) {
 type RawClient =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Connect to a stack's `/sync` endpoint as a bare websocket client.
-async fn raw_connect(addr: SocketAddr) -> RawClient {
+/// Connect to a stack's `/sync` endpoint as a bare websocket client. `None`
+/// if the dial fails, so the calling test fails in test context.
+async fn raw_connect(addr: SocketAddr) -> Option<RawClient> {
     let (stream, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/sync"))
         .await
-        .unwrap();
-    stream
+        .ok()?;
+    Some(stream)
 }
 
 fn tagged(tag: u8, payload: &[u8]) -> Vec<u8> {
@@ -178,43 +194,51 @@ fn hello_frame(device_id: &str, device_name: &str, scope: &str) -> Vec<u8> {
         "proto": PROTOCOL_VERSION,
         "scope": scope,
     });
-    tagged(TAG_HELLO, &serde_json::to_vec(&json).unwrap())
+    // Serializing a `serde_json::Value` cannot fail; the default mirrors the
+    // production encoder's infallible fallback.
+    tagged(TAG_HELLO, &serde_json::to_vec(&json).unwrap_or_default())
 }
 
 async fn raw_send(client: &mut RawClient, frame: Vec<u8>) {
-    client.send(WsMessage::Binary(frame.into())).await.unwrap();
+    // A send failure means the connection is gone; the test surfaces it in
+    // test context via the next `raw_recv` returning `None`, so swallowing the
+    // error here keeps the helper from panicking outside a test function.
+    let _ = client.send(WsMessage::Binary(frame.into())).await;
 }
 
-/// Next binary frame, skipping control traffic; `None` once the server
-/// closed. Panics instead of hanging when nothing arrives within [`TIMEOUT`].
+/// Next binary frame, skipping control traffic; `None` once the server closed
+/// or nothing arrives within [`TIMEOUT`] (the calling test then fails in test
+/// context rather than this helper panicking).
 async fn raw_recv(client: &mut RawClient) -> Option<Vec<u8>> {
     loop {
-        let message = tokio::time::timeout(TIMEOUT, client.next())
-            .await
-            .expect("timed out waiting for a frame")?;
+        let message = tokio::time::timeout(TIMEOUT, client.next()).await.ok()??;
         match message {
             Ok(WsMessage::Binary(payload)) => return Some(payload.to_vec()),
-            Ok(WsMessage::Close(_)) => return None,
-            Ok(_) => continue,
-            Err(_) => return None,
+            Ok(WsMessage::Close(_)) | Err(_) => return None,
+            Ok(_) => {}
         }
     }
 }
 
 /// Drive a raw client through the handshake in `scope`: send our HELLO, read
-/// the server's HELLO and SYNC_STEP_1, and return the server's state vector.
+/// the server's HELLO and `SYNC_STEP_1`, and return the server's state vector.
+/// `None` if the server deviates from the handshake, so the calling test fails
+/// in test context rather than this helper panicking.
 async fn raw_handshake(
     client: &mut RawClient,
     device_id: &str,
     device_name: &str,
     scope: &str,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     raw_send(client, hello_frame(device_id, device_name, scope)).await;
-    let hello = raw_recv(client).await.expect("server HELLO");
-    assert_eq!(hello[0], TAG_HELLO);
-    let step1 = raw_recv(client).await.expect("server SYNC_STEP_1");
-    assert_eq!(step1[0], TAG_SYNC_STEP_1);
-    step1[1..].to_vec()
+    let hello = raw_recv(client).await?;
+    let (&hello_tag, _) = hello.split_first()?;
+    if hello_tag != TAG_HELLO {
+        return None;
+    }
+    let step1 = raw_recv(client).await?;
+    let (&step1_tag, state_vector) = step1.split_first()?;
+    (step1_tag == TAG_SYNC_STEP_1).then(|| state_vector.to_vec())
 }
 
 #[test]
@@ -226,8 +250,8 @@ fn keepalive_constants_are_sane() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mutual_allow_connects_once_and_syncs_both_ways() {
-    let mut a = stack("aaa", &["bbb"]).await;
-    let mut b = stack("bbb", &["aaa"]).await;
+    let mut a = stack("aaa", &["bbb"]).await.expect("test stack");
+    let mut b = stack("bbb", &["aaa"]).await.expect("test stack");
     connect_mutually(&a, &b);
 
     expect_event(
@@ -267,8 +291,8 @@ async fn mutual_allow_connects_once_and_syncs_both_ways() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_sided_allow_is_refused() {
-    let mut a = stack("aaa", &["bbb"]).await;
-    let mut b = stack("bbb", &[]).await;
+    let mut a = stack("aaa", &["bbb"]).await.expect("test stack");
+    let mut b = stack("bbb", &[]).await.expect("test stack");
     connect_mutually(&a, &b);
 
     a.doc.add_entry(&a.device, "secret".into());
@@ -297,8 +321,8 @@ async fn one_sided_allow_is_refused() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn disallow_hangs_up_and_both_sides_observe_disconnect() {
-    let mut a = stack("aaa", &["bbb"]).await;
-    let mut b = stack("bbb", &["aaa"]).await;
+    let mut a = stack("aaa", &["bbb"]).await.expect("test stack");
+    let mut b = stack("bbb", &["aaa"]).await.expect("test stack");
     connect_mutually(&a, &b);
 
     expect_event(
@@ -328,8 +352,8 @@ async fn disallow_hangs_up_and_both_sides_observe_disconnect() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn dialer_reconnects_after_peer_returns() {
-    let mut a = stack("aaa", &["bbb"]).await;
-    let b = stack("bbb", &["aaa"]).await;
+    let mut a = stack("aaa", &["bbb"]).await.expect("test stack");
+    let b = stack("bbb", &["aaa"]).await.expect("test stack");
     connect_mutually(&a, &b);
 
     expect_event(
@@ -359,11 +383,13 @@ async fn dialer_reconnects_after_peer_returns() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn duplicate_hello_takes_over_and_sync_still_works() {
-    let mut a = stack("aaa", &["zzz"]).await;
+    let mut a = stack("aaa", &["zzz"]).await.expect("test stack");
 
     // First connection for "zzz" completes handshake + initial sync.
-    let mut client1 = raw_connect(a.addr).await;
-    let _server_sv = raw_handshake(&mut client1, "zzz", "raw-1", "devices").await;
+    let mut client1 = raw_connect(a.addr).await.expect("connect to test stack");
+    let _server_sv = raw_handshake(&mut client1, "zzz", "raw-1", "devices")
+        .await
+        .expect("handshake");
     let fresh = ClipDoc::new();
     raw_send(&mut client1, tagged(TAG_SYNC_STEP_1, &fresh.state_vector())).await;
     expect_event(
@@ -376,8 +402,10 @@ async fn duplicate_hello_takes_over_and_sync_still_works() {
 
     // Second connection for the same device id must take over: the old
     // socket is hung up and the new one syncs.
-    let mut client2 = raw_connect(a.addr).await;
-    let server_sv = raw_handshake(&mut client2, "zzz", "raw-2", "devices").await;
+    let mut client2 = raw_connect(a.addr).await.expect("connect to test stack");
+    let server_sv = raw_handshake(&mut client2, "zzz", "raw-2", "devices")
+        .await
+        .expect("handshake");
 
     assert!(
         raw_recv(&mut client1).await.is_none(),
@@ -427,8 +455,8 @@ async fn duplicate_hello_takes_over_and_sync_still_works() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn keepalive_pings_keep_an_idle_connection_alive() {
-    let mut a = stack("aaa", &["bbb"]).await;
-    let mut b = stack("bbb", &["aaa"]).await;
+    let mut a = stack("aaa", &["bbb"]).await.expect("test stack");
+    let mut b = stack("bbb", &["aaa"]).await.expect("test stack");
     // Aggressive intervals so several ping rounds fit into a short test; the
     // connection only survives the idle timeout if pings/pongs actually flow
     // and count as activity.
@@ -476,12 +504,14 @@ async fn keepalive_pings_keep_an_idle_connection_alive() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn silent_peer_is_hung_up_after_idle_timeout() {
-    let mut a = stack("aaa", &["zzz"]).await;
+    let mut a = stack("aaa", &["zzz"]).await.expect("test stack");
     a.manager
         .set_keepalive(Duration::from_millis(100), Duration::from_millis(500));
 
-    let mut client = raw_connect(a.addr).await;
-    let _server_sv = raw_handshake(&mut client, "zzz", "raw-silent", "devices").await;
+    let mut client = raw_connect(a.addr).await.expect("connect to test stack");
+    let _server_sv = raw_handshake(&mut client, "zzz", "raw-silent", "devices")
+        .await
+        .expect("handshake");
     let fresh = ClipDoc::new();
     raw_send(&mut client, tagged(TAG_SYNC_STEP_1, &fresh.state_vector())).await;
     expect_event(
@@ -507,8 +537,12 @@ async fn silent_peer_is_hung_up_after_idle_timeout() {
 async fn room_syncs_between_strangers_without_touching_devices() {
     // Neither stack allows the other: the room must connect anyway, because
     // the allowlist does not govern rooms.
-    let mut a = stack_with_rooms("aaa", &[], &["attic"]).await;
-    let mut b = stack_with_rooms("bbb", &[], &["attic"]).await;
+    let mut a = stack_with_rooms("aaa", &[], &["attic"])
+        .await
+        .expect("test stack");
+    let mut b = stack_with_rooms("bbb", &[], &["attic"])
+        .await
+        .expect("test stack");
     let room = Scope::room("attic");
     connect_mutually(&a, &b);
 
@@ -550,9 +584,9 @@ async fn room_syncs_between_strangers_without_touching_devices() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unjoined_room_hello_is_refused_even_for_allowed_device() {
     // "zzz" is on the devices allowlist, which must NOT grant room access.
-    let mut a = stack("aaa", &["zzz"]).await;
+    let mut a = stack("aaa", &["zzz"]).await.expect("test stack");
 
-    let mut client = raw_connect(a.addr).await;
+    let mut client = raw_connect(a.addr).await.expect("connect to test stack");
     raw_send(&mut client, hello_frame("zzz", "raw-room", "room:attic")).await;
     // The server sends its HELLO before validating ours, then closes without
     // any document frame.
@@ -576,8 +610,12 @@ async fn unjoined_room_hello_is_refused_even_for_allowed_device() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn leave_room_hangs_up_and_stops_room_sync() {
-    let mut a = stack_with_rooms("aaa", &[], &["attic"]).await;
-    let mut b = stack_with_rooms("bbb", &[], &["attic"]).await;
+    let mut a = stack_with_rooms("aaa", &[], &["attic"])
+        .await
+        .expect("test stack");
+    let mut b = stack_with_rooms("bbb", &[], &["attic"])
+        .await
+        .expect("test stack");
     let room = Scope::room("attic");
     connect_mutually(&a, &b);
 
@@ -619,8 +657,12 @@ async fn leave_room_hangs_up_and_stops_room_sync() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn devices_and_room_connections_coexist_without_cross_bleed() {
-    let mut a = stack_with_rooms("aaa", &["bbb"], &["attic"]).await;
-    let mut b = stack_with_rooms("bbb", &["aaa"], &["attic"]).await;
+    let mut a = stack_with_rooms("aaa", &["bbb"], &["attic"])
+        .await
+        .expect("test stack");
+    let mut b = stack_with_rooms("bbb", &["aaa"], &["attic"])
+        .await
+        .expect("test stack");
     let room = Scope::room("attic");
     connect_mutually(&a, &b);
 
@@ -681,13 +723,17 @@ async fn devices_and_room_connections_coexist_without_cross_bleed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn takeover_is_keyed_per_device_and_scope() {
-    let mut a = stack_with_rooms("aaa", &["zzz"], &["attic"]).await;
+    let mut a = stack_with_rooms("aaa", &["zzz"], &["attic"])
+        .await
+        .expect("test stack");
     let room = Scope::room("attic");
     let a_room = a.docs.get(&room).unwrap();
 
     // Devices-scope connection for "zzz".
-    let mut devices_client = raw_connect(a.addr).await;
-    let _ = raw_handshake(&mut devices_client, "zzz", "raw-devices", "devices").await;
+    let mut devices_client = raw_connect(a.addr).await.expect("connect to test stack");
+    raw_handshake(&mut devices_client, "zzz", "raw-devices", "devices")
+        .await
+        .expect("handshake");
     raw_send(
         &mut devices_client,
         tagged(TAG_SYNC_STEP_1, &ClipDoc::new().state_vector()),
@@ -703,8 +749,10 @@ async fn takeover_is_keyed_per_device_and_scope() {
 
     // A room-scope connection for the same device id must coexist with the
     // devices one, not displace it.
-    let mut room_client1 = raw_connect(a.addr).await;
-    let _ = raw_handshake(&mut room_client1, "zzz", "raw-room-1", "room:attic").await;
+    let mut room_client1 = raw_connect(a.addr).await.expect("connect to test stack");
+    raw_handshake(&mut room_client1, "zzz", "raw-room-1", "room:attic")
+        .await
+        .expect("handshake");
     raw_send(
         &mut room_client1,
         tagged(TAG_SYNC_STEP_1, &ClipDoc::new().state_vector()),
@@ -728,8 +776,10 @@ async fn takeover_is_keyed_per_device_and_scope() {
 
     // A second room connection for the same device takes over the room
     // connection only.
-    let mut room_client2 = raw_connect(a.addr).await;
-    let _ = raw_handshake(&mut room_client2, "zzz", "raw-room-2", "room:attic").await;
+    let mut room_client2 = raw_connect(a.addr).await.expect("connect to test stack");
+    raw_handshake(&mut room_client2, "zzz", "raw-room-2", "room:attic")
+        .await
+        .expect("handshake");
     assert!(
         raw_recv(&mut room_client1).await.is_none(),
         "the displaced room connection must be closed by the server"
@@ -787,8 +837,8 @@ async fn takeover_is_keyed_per_device_and_scope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn joining_after_discovery_dials_known_peers() {
-    let mut a = stack("aaa", &[]).await;
-    let mut b = stack("bbb", &[]).await;
+    let mut a = stack("aaa", &[]).await.expect("test stack");
+    let mut b = stack("bbb", &[]).await.expect("test stack");
     let room = Scope::room("attic");
 
     // Discovery happens before either side joins; both already advertise the

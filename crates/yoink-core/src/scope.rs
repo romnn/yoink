@@ -17,19 +17,30 @@ pub const MAX_ROOM_NAME_LEN: usize = 48;
 /// LAN can join; nothing enters a room except by deliberate user action.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {
+    /// The personal clipboard, shared only between this user's allowlisted
+    /// devices.
     Devices,
+    /// A named LAN-wide room anyone can join; carries the room name.
     Room(String),
 }
 
 impl Scope {
+    /// Construct a [`Scope::Room`] from any string-like name. The caller is
+    /// responsible for sanitizing untrusted names first (see
+    /// [`sanitize_room_name`]).
+    #[must_use]
     pub fn room(name: impl Into<String>) -> Self {
         Scope::Room(name.into())
     }
 
+    /// Whether this is the personal-clipboard scope.
+    #[must_use]
     pub fn is_devices(&self) -> bool {
         matches!(self, Scope::Devices)
     }
 
+    /// The room name, or `None` for [`Scope::Devices`].
+    #[must_use]
     pub fn room_name(&self) -> Option<&str> {
         match self {
             Scope::Devices => None,
@@ -47,6 +58,7 @@ impl fmt::Display for Scope {
     }
 }
 
+/// A string failed to parse as a [`Scope`]; carries the offending input.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid scope: {0:?}")]
 pub struct InvalidScope(pub String);
@@ -85,6 +97,7 @@ impl<'de> Deserialize<'de> for Scope {
 /// Reduce arbitrary user input ("My Room!", "/myroom") to a canonical room
 /// name: lowercase ASCII alphanumerics and single hyphens, trimmed, at most
 /// [`MAX_ROOM_NAME_LEN`] chars. Returns `None` when nothing usable remains.
+#[must_use]
 pub fn sanitize_room_name(input: &str) -> Option<String> {
     let mut name = String::new();
     let mut last_hyphen = true;
@@ -108,30 +121,49 @@ pub fn sanitize_room_name(input: &str) -> Option<String> {
 /// always exists; room docs are created when a room is joined and removed
 /// when it is left (their snapshots may outlive them on disk).
 pub struct DocSet {
-    docs: Mutex<HashMap<Scope, Arc<ClipDoc>>>,
+    /// The personal-clipboard doc, kept in its own field rather than the
+    /// `rooms` map so it is unconditionally present and `remove` can never
+    /// drop it. This removes the only would-be panic path from [`devices`].
+    ///
+    /// [`devices`]: DocSet::devices
+    devices: Arc<ClipDoc>,
+    rooms: Mutex<HashMap<Scope, Arc<ClipDoc>>>,
 }
 
 impl DocSet {
+    /// Create a fresh doc set with an empty personal clipboard and no rooms.
+    #[must_use]
     pub fn new() -> Self {
-        let mut docs = HashMap::new();
-        docs.insert(Scope::Devices, Arc::new(ClipDoc::new()));
         Self {
-            docs: Mutex::new(docs),
+            devices: Arc::new(ClipDoc::new()),
+            rooms: Mutex::new(HashMap::new()),
         }
     }
 
     /// The personal clipboard doc (always present).
+    #[must_use]
     pub fn devices(&self) -> Arc<ClipDoc> {
-        self.get(&Scope::Devices)
-            .expect("the devices doc exists for the DocSet's whole lifetime")
+        Arc::clone(&self.devices)
     }
 
+    /// The doc for `scope`, or `None` if no room doc by that name exists. The
+    /// `Devices` scope always resolves.
+    #[must_use]
     pub fn get(&self, scope: &Scope) -> Option<Arc<ClipDoc>> {
-        self.docs.lock().get(scope).cloned()
+        if scope.is_devices() {
+            return Some(self.devices());
+        }
+        self.rooms.lock().get(scope).cloned()
     }
 
+    /// The doc for `scope`, creating an empty room doc if absent. For the
+    /// `Devices` scope this is equivalent to [`DocSet::devices`].
+    #[must_use]
     pub fn get_or_create(&self, scope: &Scope) -> Arc<ClipDoc> {
-        self.docs
+        if scope.is_devices() {
+            return self.devices();
+        }
+        self.rooms
             .lock()
             .entry(scope.clone())
             .or_insert_with(|| Arc::new(ClipDoc::new()))
@@ -141,12 +173,15 @@ impl DocSet {
     /// Drop a room doc (leaving a room). The `Devices` doc is never removed.
     pub fn remove(&self, scope: &Scope) {
         if !scope.is_devices() {
-            self.docs.lock().remove(scope);
+            self.rooms.lock().remove(scope);
         }
     }
 
+    /// Every scope currently held, sorted, always including `Devices`.
+    #[must_use]
     pub fn scopes(&self) -> Vec<Scope> {
-        let mut scopes: Vec<Scope> = self.docs.lock().keys().cloned().collect();
+        let mut scopes: Vec<Scope> = self.rooms.lock().keys().cloned().collect();
+        scopes.push(Scope::Devices);
         scopes.sort();
         scopes
     }

@@ -13,7 +13,7 @@
 //!    `devices`, `origin` is remote, auto-apply is on and the latest entry
 //!    is from another device, wasn't applied before (track last applied
 //!    entry id) and is fresh (created within ~30s of local now, so a
-//!    SYNC_STEP_2 backlog replay never clobbers the clipboard with stale
+//!    `SYNC_STEP_2` backlog replay never clobbers the clipboard with stale
 //!    entries) → `clipboard.set_text`; room updates never touch the OS
 //!    clipboard; notify the UI.
 //! 3. Discovery events → update the peer registry (lost peers are kept
@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use yoink_clipboard::ClipboardHandle;
-use yoink_core::{DeviceInfo, DocSet, Scope};
+use yoink_core::{DeviceInfo, DocSet};
 use yoink_discovery::Discovery;
 use yoink_server::{ServerCtx, Settings};
 use yoink_sync::SyncManager;
@@ -130,19 +130,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // (broadcast receivers only see messages sent after subscribing) and
     // sync joins the restored room docs instead of creating empty ones.
     let (doc_events_tx, doc_rx) = mpsc::channel(app::DOC_EVENT_QUEUE);
-    let mut forwarders = HashMap::new();
-    let mut snapshots = HashMap::new();
-    let mut scopes = vec![Scope::Devices];
-    scopes.extend(config.rooms.iter().map(Scope::room));
-    for scope in scopes {
-        let path = app::snapshot_path(&config_dir, &scope);
-        let doc = app::restore_doc(&docs, scope.clone(), &path);
-        forwarders.insert(
-            scope.clone(),
-            app::spawn_doc_forwarder(scope.clone(), &doc, doc_events_tx.clone()),
-        );
-        snapshots.insert(scope, app::SnapshotState::clean(path));
-    }
+    let (forwarders, snapshots) =
+        app::restore_scopes(&docs, &config_dir, &config.rooms, &doc_events_tx);
 
     let listener = bind_listener(args.port).await?;
     let port = listener
@@ -160,11 +149,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
 
     let (clipboard, clipboard_rx) = ClipboardHandle::spawn(Duration::from_millis(400));
+    let seeded_rooms: std::collections::HashSet<String> = config.rooms.iter().cloned().collect();
     let (sync, sync_rx) = SyncManager::new(
         docs.clone(),
         device.clone(),
         config.allowed.iter().cloned().collect(),
-        config.rooms.iter().cloned().collect(),
+        &seeded_rooms,
     );
     let (discovery, discovery_rx) = Discovery::start(&device.id, &device.name, port, &config.rooms)
         .context("failed to start mDNS peer discovery")?;
@@ -190,19 +180,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         commands: commands_tx,
         notify: notify_tx.clone(),
     };
-    if let Some(v6_listener) = v6_listener {
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            if let Err(err) = yoink_server::serve(v6_listener, ctx).await {
-                tracing::error!(error = %err, "IPv6 web server exited");
-            }
-        });
-    }
-    tokio::spawn(async move {
-        if let Err(err) = yoink_server::serve(listener, ctx).await {
-            tracing::error!(error = %err, "web server exited");
-        }
-    });
+    spawn_web_servers(ctx, listener, v6_listener);
 
     let url = format!("http://localhost:{port}");
     println!("yoink — shared LAN clipboard");
@@ -234,13 +212,37 @@ async fn run(args: Args) -> anyhow::Result<()> {
         forwarders,
     };
     app.run(AppChannels {
-        clipboard_rx,
-        doc_rx,
-        discovery_rx,
-        sync_rx,
-        command_rx,
+        clipboard: clipboard_rx,
+        doc: doc_rx,
+        discovery: discovery_rx,
+        sync: sync_rx,
+        command: command_rx,
     })
     .await
+}
+
+/// Spawn the web server on the primary `0.0.0.0` listener plus, when present,
+/// the companion `[::]` one. Each runs as its own detached task; an unexpected
+/// `serve` exit is logged but never brings the process down, since the app
+/// loop (clipboard, sync) is the part that must keep running.
+fn spawn_web_servers(
+    ctx: ServerCtx,
+    listener: tokio::net::TcpListener,
+    v6_listener: Option<tokio::net::TcpListener>,
+) {
+    if let Some(v6_listener) = v6_listener {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = yoink_server::serve(v6_listener, ctx).await {
+                tracing::error!(error = %err, "IPv6 web server exited");
+            }
+        });
+    }
+    tokio::spawn(async move {
+        if let Err(err) = yoink_server::serve(listener, ctx).await {
+            tracing::error!(error = %err, "web server exited");
+        }
+    });
 }
 
 fn resolve_config_dir(flag: Option<PathBuf>) -> anyhow::Result<PathBuf> {

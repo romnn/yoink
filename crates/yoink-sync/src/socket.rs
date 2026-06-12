@@ -1,4 +1,4 @@
-//! Unifies inbound (axum) and outbound (tokio-tungstenite) WebSockets behind
+//! Unifies inbound (axum) and outbound (tokio-tungstenite) `WebSockets` behind
 //! one binary-frame interface so the connection logic is role-agnostic.
 
 use axum::extract::ws;

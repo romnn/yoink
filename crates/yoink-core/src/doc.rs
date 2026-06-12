@@ -18,10 +18,13 @@ pub struct DocUpdate {
     pub origin: Option<String>,
 }
 
+/// Why a remote update or state vector could not be ingested.
 #[derive(Debug, Error)]
 pub enum DocError {
+    /// The byte slice was not a valid lib0 v1 update or state vector.
     #[error("malformed update or state vector: {0}")]
     Decode(#[from] yrs::encoding::read::Error),
+    /// The update decoded but yrs rejected it during integration.
     #[error("failed to apply update: {0}")]
     Apply(#[from] yrs::error::UpdateError),
 }
@@ -43,6 +46,15 @@ struct DocState {
 }
 
 impl ClipDoc {
+    /// Create an empty document with its update observer already wired to the
+    /// broadcast channel returned by [`ClipDoc::subscribe`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the update observer cannot be registered. This is
+    /// unreachable: registration needs a read transaction, and nothing else
+    /// can hold one on a doc that has not yet escaped this constructor.
+    #[must_use]
     pub fn new() -> Self {
         let doc = Doc::new();
         let entries = doc.get_or_insert_array("entries");
@@ -50,6 +62,10 @@ impl ClipDoc {
         let tx = updates.clone();
         // Cannot fail here: registering the observer acquires a read
         // transaction and nothing else can hold one on a freshly created doc.
+        #[allow(
+            clippy::expect_used,
+            reason = "observer registration only fails when a read txn is already held; impossible on a doc still inside its constructor (see the # Panics section)"
+        )]
         let observer = doc
             .observe_update_v1(move |txn, event| {
                 let origin = txn
@@ -73,6 +89,11 @@ impl ClipDoc {
     }
 
     /// Restore a document from a snapshot produced by [`ClipDoc::snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::Decode`] if `snapshot` is not a valid lib0 v1
+    /// update, or [`DocError::Apply`] if yrs rejects it during integration.
     pub fn load(snapshot: &[u8]) -> Result<Self, DocError> {
         let this = Self::new();
         this.apply_update(snapshot, None)?;
@@ -107,10 +128,13 @@ impl ClipDoc {
             .collect()
     }
 
+    /// The most recently appended entry, or `None` when history is empty.
     pub fn latest(&self) -> Option<ClipEntry> {
         self.entries().pop()
     }
 
+    /// This document's state vector, lib0 v1 encoded, for a peer to diff
+    /// against in sync step 1.
     pub fn state_vector(&self) -> Vec<u8> {
         let state = self.state.lock();
         let txn = state.doc.transact();
@@ -124,6 +148,11 @@ impl ClipDoc {
     /// relays everything it holds, and if parked updates were excluded
     /// (`encode_diff_v1`) they would be invisible to C until B happened to
     /// integrate them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::Decode`] if `remote_state_vector` is not a valid
+    /// lib0 v1 state vector.
     pub fn diff(&self, remote_state_vector: &[u8]) -> Result<Vec<u8>, DocError> {
         let sv = StateVector::decode_v1(remote_state_vector)?;
         let state = self.state.lock();
@@ -133,6 +162,11 @@ impl ClipDoc {
 
     /// Apply a remote update. `origin` should be the sending peer's device id
     /// so subscribers can avoid echoing the update back to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocError::Decode`] if `update` is not a valid lib0 v1 update,
+    /// or [`DocError::Apply`] if yrs rejects it during integration.
     pub fn apply_update(&self, update: &[u8], origin: Option<&str>) -> Result<(), DocError> {
         let parsed = Update::decode_v1(update)?;
         let state = self.state.lock();
@@ -218,7 +252,7 @@ mod tests {
             doc.add_entry(&dev, format!("entry {i}"));
         }
         let entries = doc.entries();
-        assert_eq!(entries.len() as u32, MAX_HISTORY);
+        assert_eq!(u32::try_from(entries.len()).unwrap(), MAX_HISTORY);
         assert_eq!(
             entries.last().unwrap().text,
             format!("entry {}", MAX_HISTORY + 49)

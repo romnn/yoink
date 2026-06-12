@@ -32,11 +32,11 @@ impl Drop for AvailabilityGuard {
 /// flag the handle reads; it stays true only while this thread runs with a
 /// working clipboard.
 pub(crate) fn run(
-    cmd_rx: Receiver<Command>,
-    event_tx: tokio::sync::mpsc::Sender<ClipboardEvent>,
-    init_tx: Sender<bool>,
+    cmd_rx: &Receiver<Command>,
+    event_tx: &tokio::sync::mpsc::Sender<ClipboardEvent>,
+    init_tx: &Sender<bool>,
     poll_interval: Duration,
-    available: Arc<AtomicBool>,
+    available: &Arc<AtomicBool>,
 ) {
     let _guard = AvailabilityGuard(available.clone());
     let mut clipboard = match arboard::Clipboard::new() {
@@ -81,7 +81,7 @@ pub(crate) fn run(
                     tracing::warn!(error = %err, "failed to write text to OS clipboard");
                 }
             },
-            Err(RecvTimeoutError::Timeout) => poll(&mut clipboard, &mut state, &event_tx),
+            Err(RecvTimeoutError::Timeout) => poll(&mut clipboard, &mut state, event_tx),
             // All handles dropped; nothing can reach us anymore.
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -107,14 +107,14 @@ fn poll(
         return;
     };
     match event_tx.try_send(event) {
-        Ok(()) => {}
+        // Delivered, or the receiver is gone (app shutting down) and we keep
+        // serving set_text quietly — both are nothing to do here.
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
         // Dropping is better than blocking the clipboard thread forever on a
         // stalled consumer; the entry is lost but the watcher stays live.
         Err(TrySendError::Full(_)) => {
             tracing::warn!("clipboard event channel full; dropping copied text");
         }
-        // Receiver gone (app shutting down); keep serving set_text quietly.
-        Err(TrySendError::Closed(_)) => {}
     }
 }
 
@@ -135,11 +135,11 @@ mod tests {
         let available = Arc::new(AtomicBool::new(true));
 
         run(
-            cmd_rx,
-            event_tx,
-            init_tx,
+            &cmd_rx,
+            &event_tx,
+            &init_tx,
             Duration::from_millis(1),
-            available.clone(),
+            &available,
         );
 
         assert!(!available.load(Ordering::SeqCst));

@@ -39,7 +39,7 @@ pub(crate) fn is_duplicate(text: &str, recent: &[String]) -> bool {
     recent.iter().any(|recent_text| recent_text == text)
 }
 
-/// Auto-apply freshness window. A SYNC_STEP_2 backlog apply is
+/// Auto-apply freshness window. A `SYNC_STEP_2` backlog apply is
 /// indistinguishable from a live UPDATE at this layer, so without a
 /// freshness gate a peer (re)connecting would clobber the local clipboard
 /// with its newest *backlog* entry, however old. Tradeoff: devices whose
@@ -67,8 +67,8 @@ impl AutoApplyCheck<'_> {
     pub(crate) fn should_apply(&self) -> bool {
         // abs_diff because clock skew can also stamp a genuinely fresh entry
         // "in the future"; both directions are treated the same.
-        let fresh =
-            self.now_ms.abs_diff(self.entry_created_at_ms) <= AUTO_APPLY_MAX_AGE.as_millis() as u64;
+        let max_age_ms = u64::try_from(AUTO_APPLY_MAX_AGE.as_millis()).unwrap_or(u64::MAX);
+        let fresh = self.now_ms.abs_diff(self.entry_created_at_ms) <= max_age_ms;
         self.auto_apply
             && self.clipboard_available
             && fresh
@@ -198,8 +198,8 @@ pub(crate) fn write_snapshot(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// `DocSet`, so an insert-unless-present would silently discard the loaded
 /// history and keep the empty pre-created doc. Merging also makes a
 /// double-join race harmless — both snapshots simply converge.
-pub(crate) fn restore_doc(docs: &DocSet, scope: Scope, path: &Path) -> Arc<ClipDoc> {
-    let doc = docs.get_or_create(&scope);
+pub(crate) fn restore_doc(docs: &DocSet, scope: &Scope, path: &Path) -> Arc<ClipDoc> {
+    let doc = docs.get_or_create(scope);
     match std::fs::read(path) {
         Ok(snapshot) => {
             // Clipboard history is expendable, so unlike the config a
@@ -286,13 +286,50 @@ async fn forward_doc_updates(
     }
 }
 
+/// Restore every persisted scope's doc and wire its update forwarder, used by
+/// `main` to seed the loop's [`App`] before sync or the server exist. The
+/// `devices` scope is always restored first, followed by every joined room;
+/// doing this up front guarantees no update slips past the loop and that sync
+/// joins the restored room docs instead of creating empty ones.
+///
+/// Returns the per-scope forwarder handles and clean (not-yet-dirty) snapshot
+/// states, both keyed by scope, ready to be moved into the [`App`].
+pub(crate) fn restore_scopes(
+    docs: &DocSet,
+    config_dir: &Path,
+    rooms: &[String],
+    doc_events_tx: &mpsc::Sender<DocEvent>,
+) -> (
+    HashMap<Scope, tokio::task::JoinHandle<()>>,
+    HashMap<Scope, SnapshotState>,
+) {
+    let mut forwarders = HashMap::new();
+    let mut snapshots = HashMap::new();
+    let scopes = std::iter::once(Scope::Devices).chain(rooms.iter().map(Scope::room));
+    for scope in scopes {
+        let path = snapshot_path(config_dir, &scope);
+        let doc = restore_doc(docs, &scope, &path);
+        forwarders.insert(
+            scope.clone(),
+            spawn_doc_forwarder(scope.clone(), &doc, doc_events_tx.clone()),
+        );
+        snapshots.insert(scope, SnapshotState::clean(path));
+    }
+    (forwarders, snapshots)
+}
+
 /// All receivers the loop selects over, handed in by `main` after wiring.
 pub(crate) struct AppChannels {
-    pub clipboard_rx: mpsc::Receiver<ClipboardEvent>,
-    pub doc_rx: mpsc::Receiver<DocEvent>,
-    pub discovery_rx: mpsc::Receiver<DiscoveryEvent>,
-    pub sync_rx: mpsc::Receiver<SyncEvent>,
-    pub command_rx: mpsc::Receiver<AppCommand>,
+    /// OS clipboard `Copied` events.
+    pub clipboard: mpsc::Receiver<ClipboardEvent>,
+    /// Merged per-scope doc updates (and lag signals) from the forwarders.
+    pub doc: mpsc::Receiver<DocEvent>,
+    /// mDNS peer found/lost events.
+    pub discovery: mpsc::Receiver<DiscoveryEvent>,
+    /// Per-scope peer connect/disconnect events from sync.
+    pub sync: mpsc::Receiver<SyncEvent>,
+    /// Commands issued by the web server (the UI's only mutation path).
+    pub command: mpsc::Receiver<AppCommand>,
 }
 
 pub(crate) struct App {
@@ -334,13 +371,13 @@ impl App {
 
         loop {
             tokio::select! {
-                Some(event) = ch.clipboard_rx.recv() => self.on_clipboard(event),
+                Some(event) = ch.clipboard.recv() => self.on_clipboard(event),
                 // The loop holds a sender (`doc_events_tx`), so this channel
                 // can never close from under the select.
-                Some(event) = ch.doc_rx.recv() => self.on_doc_event(event),
-                Some(event) = ch.discovery_rx.recv() => self.on_discovery(event),
-                Some(event) = ch.sync_rx.recv() => self.on_sync(event),
-                Some(command) = ch.command_rx.recv() => self.on_command(command).await,
+                Some(event) = ch.doc.recv() => self.on_doc_event(event),
+                Some(event) = ch.discovery.recv() => self.on_discovery(event),
+                Some(event) = ch.sync.recv() => self.on_sync(&event),
+                Some(command) = ch.command.recv() => self.on_command(command).await,
                 _ = flush.tick() => self.flush_dirty().await,
                 result = &mut ctrl_c => {
                     if let Err(err) = result {
@@ -355,7 +392,7 @@ impl App {
         // Settle in-flight background writes first so the final writes below
         // can never race them over the same tmp files. Blocking the loop is
         // fine here: there is nothing left to consume.
-        for (scope, snapshot) in self.snapshots.iter_mut() {
+        for (scope, snapshot) in &mut self.snapshots {
             if let Err(err) = snapshot.write.reap().await {
                 snapshot.dirty = true;
                 tracing::warn!(error = %err, %scope, "in-flight snapshot write failed during shutdown");
@@ -402,7 +439,7 @@ impl App {
 
     fn on_doc_event(&mut self, event: DocEvent) {
         match event {
-            DocEvent::Update { scope, update } => self.on_doc_update(scope, update),
+            DocEvent::Update { scope, update } => self.on_doc_update(&scope, &update),
             DocEvent::Lagged { scope } => {
                 self.mark_snapshot_dirty(&scope);
                 self.notify_ui();
@@ -410,8 +447,8 @@ impl App {
         }
     }
 
-    fn on_doc_update(&mut self, scope: Scope, update: DocUpdate) {
-        self.mark_snapshot_dirty(&scope);
+    fn on_doc_update(&mut self, scope: &Scope, update: &DocUpdate) {
+        self.mark_snapshot_dirty(scope);
         // Auto-apply is exclusive to the devices scope: a room update never
         // touches the OS clipboard passively, no matter who sent it —
         // copying out of a room is always a deliberate `CopyEntry`.
@@ -473,8 +510,8 @@ impl App {
         self.notify_ui();
     }
 
-    fn on_sync(&mut self, event: SyncEvent) {
-        match &event {
+    fn on_sync(&mut self, event: &SyncEvent) {
+        match event {
             SyncEvent::PeerConnected {
                 device_id,
                 device_name,
@@ -561,12 +598,12 @@ impl App {
                     tracing::warn!(%scope, "copy_entry for a scope with no open doc; dropping");
                     return;
                 };
-                match doc.entries().into_iter().find(|entry| entry.id == id) {
-                    // Copying *out* of a room is a deliberate action and
-                    // therefore allowed; only passive capture/auto-apply is
-                    // devices-only.
-                    Some(entry) => self.clipboard.set_text(entry.text),
-                    None => tracing::warn!(%id, %scope, "copy requested for unknown entry"),
+                // Copying *out* of a room is a deliberate action and therefore
+                // allowed; only passive capture/auto-apply is devices-only.
+                if let Some(entry) = doc.entries().into_iter().find(|entry| entry.id == id) {
+                    self.clipboard.set_text(entry.text);
+                } else {
+                    tracing::warn!(%id, %scope, "copy requested for unknown entry");
                 }
             }
             AppCommand::JoinRoom { name } => self.join_room(&name),
@@ -592,7 +629,7 @@ impl App {
         // `sync.join_room`, so sync finds the restored doc (instead of
         // creating an empty one) and no early peer update slips past the
         // loop.
-        let doc = restore_doc(&self.docs, scope.clone(), &path);
+        let doc = restore_doc(&self.docs, &scope, &path);
         self.forwarders.insert(
             scope.clone(),
             spawn_doc_forwarder(scope.clone(), &doc, self.doc_events_tx.clone()),
@@ -679,7 +716,7 @@ impl App {
     }
 
     async fn flush_snapshots(&mut self) {
-        for (scope, snapshot) in self.snapshots.iter_mut() {
+        for (scope, snapshot) in &mut self.snapshots {
             if snapshot.write.in_flight() {
                 // Still writing (slow disk); the dirty flag survives to the
                 // next tick, so nothing is lost by waiting.
@@ -766,7 +803,7 @@ mod tests {
     }
 
     fn texts(texts: &[&str]) -> Vec<String> {
-        texts.iter().map(|t| t.to_string()).collect()
+        texts.iter().map(ToString::to_string).collect()
     }
 
     fn device(id: &str) -> DeviceInfo {
@@ -860,7 +897,7 @@ mod tests {
 
     #[test]
     fn auto_apply_freshness_gate() {
-        let max = AUTO_APPLY_MAX_AGE.as_millis() as u64;
+        let max = u64::try_from(AUTO_APPLY_MAX_AGE.as_millis()).unwrap_or(u64::MAX);
         let now = 1_000_000_000;
         let at = |entry_created_at_ms: u64| AutoApplyCheck {
             entry_created_at_ms,
@@ -926,7 +963,7 @@ mod tests {
         let path = snapshot_path(dir.path(), &scope);
 
         // Join: no snapshot on disk yet, so the room starts empty.
-        let doc = restore_doc(&docs, scope.clone(), &path);
+        let doc = restore_doc(&docs, &scope, &path);
         assert!(doc.entries().is_empty());
         doc.add_entry(&device("d1"), "shared into room".into());
 
@@ -939,7 +976,7 @@ mod tests {
         assert!(docs.get(&scope).is_none());
 
         // Rejoin: history is restored from the kept snapshot.
-        let doc = restore_doc(&docs, scope.clone(), &path);
+        let doc = restore_doc(&docs, &scope, &path);
         let entries = doc.entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text, "shared into room");
@@ -961,7 +998,7 @@ mod tests {
         write_snapshot(&path, &snapshot).unwrap();
 
         let docs = DocSet::new();
-        let doc = restore_doc(&docs, Scope::Devices, &path);
+        let doc = restore_doc(&docs, &Scope::Devices, &path);
         assert_eq!(doc.entries().len(), 1);
         assert_eq!(doc.entries()[0].text, "persisted across restart");
         assert!(Arc::ptr_eq(&doc, &docs.devices()));
@@ -975,7 +1012,7 @@ mod tests {
         std::fs::write(&path, b"not a yrs update").unwrap();
 
         let docs = DocSet::new();
-        let doc = restore_doc(&docs, Scope::room("attic"), &path);
+        let doc = restore_doc(&docs, &Scope::room("attic"), &path);
         assert!(doc.entries().is_empty());
         // The corrupt file is left in place for inspection; only a
         // successful flush replaces it.

@@ -26,6 +26,8 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// entries are pruned from the front of the CRDT array.
 pub const MAX_HISTORY: u32 = 200;
 
+/// Identity a peer announces over the wire: who is sending updates and how to
+/// present them in another device's history and allowlist UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     /// Stable unique id (UUID) persisted in the device's config.
@@ -40,29 +42,48 @@ pub struct DeviceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum AppCommand {
+    /// Add or remove a peer from the personal-clipboard allowlist. Only
+    /// allowlisted devices may feed the `Devices` scope.
     SetAllowed {
+        /// Peer whose allowlist membership is being toggled.
         device_id: String,
+        /// `true` to admit the peer, `false` to revoke it.
         allowed: bool,
     },
+    /// Toggle whether incoming personal-clipboard entries are written to the
+    /// OS clipboard automatically.
     SetAutoApply {
+        /// `true` to auto-apply received entries, `false` to leave them in
+        /// history only.
         enabled: bool,
     },
+    /// Append text the user typed in the UI as a new entry in `scope`.
     AddEntry {
+        /// Clipboard text to store.
         text: String,
+        /// Scope the entry belongs to; defaults to the personal clipboard.
         #[serde(default = "Scope::default_devices")]
         scope: Scope,
     },
+    /// Copy an existing entry back onto the OS clipboard.
     CopyEntry {
+        /// Id of the entry to copy, within `scope`.
         id: String,
+        /// Scope the entry lives in; defaults to the personal clipboard.
         #[serde(default = "Scope::default_devices")]
         scope: Scope,
     },
+    /// Join (and thereby ensure the existence of) a room.
+    ///
     /// Joining is idempotent and doubles as creation — visiting a room URL
     /// is what brings the room into existence.
     JoinRoom {
+        /// Room name to join; sanitized by the event loop before use.
         name: String,
     },
+    /// Leave a room, dropping its in-memory doc.
     LeaveRoom {
+        /// Room name to leave.
         name: String,
     },
 }

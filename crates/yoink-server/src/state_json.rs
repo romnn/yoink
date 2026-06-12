@@ -230,7 +230,7 @@ mod tests {
                 name: name.into(),
                 addrs: vec![],
                 port: 4242,
-                rooms: rooms.iter().map(|r| r.to_string()).collect(),
+                rooms: rooms.iter().map(ToString::to_string).collect(),
             },
             online,
         }

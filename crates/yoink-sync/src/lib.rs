@@ -1,4 +1,4 @@
-//! Peer-to-peer document sync over WebSockets.
+//! Peer-to-peer document sync over `WebSockets`.
 //!
 //! # Wire protocol (version 2)
 //!
@@ -7,9 +7,9 @@
 //! | tag    | name        | payload                                            |
 //! |--------|-------------|----------------------------------------------------|
 //! | `0x01` | HELLO       | JSON `{"device_id","device_name","proto","scope"}` |
-//! | `0x02` | SYNC_STEP_1 | yrs state vector (lib0 v1)                         |
-//! | `0x03` | SYNC_STEP_2 | yrs update (lib0 v1), reply to SYNC_STEP_1         |
-//! | `0x04` | UPDATE      | yrs incremental update (lib0 v1)                   |
+//! | `0x02` | `SYNC_STEP_1` | yrs state vector (lib0 v1)                       |
+//! | `0x03` | `SYNC_STEP_2` | yrs update (lib0 v1), reply to `SYNC_STEP_1`     |
+//! | `0x04` | `UPDATE`      | yrs incremental update (lib0 v1)                 |
 //!
 //! `scope` is the string form of [`Scope`] (`"devices"` or `"room:{name}"`)
 //! and selects the document the connection syncs. Each connection carries
@@ -20,10 +20,10 @@
 //! check — intentionally, because a v1 peer would treat any connection as
 //! the personal clipboard.
 //!
-//! SYNC_STEP_2 is normally the reply to SYNC_STEP_1, but may also arrive
+//! `SYNC_STEP_2` is normally the reply to `SYNC_STEP_1`, but may also arrive
 //! unsolicited carrying the sender's full state: a side that lost outbound
-//! updates (its internal relay queue lagged) pushes a full-state SYNC_STEP_2
-//! plus a fresh SYNC_STEP_1 to every peer connected in the lagged scope to
+//! updates (its internal relay queue lagged) pushes a full-state `SYNC_STEP_2`
+//! plus a fresh `SYNC_STEP_1` to every peer connected in the lagged scope to
 //! repair the divergence. Applying yrs updates is idempotent, so receivers
 //! need no special handling.
 //!
@@ -42,9 +42,9 @@
 //! *takes over*: the existing connection is assumed to be a zombie (the
 //! peer restarted or gave up on it) and is torn down in favor of the new
 //! socket; connections to the same device in other scopes are untouched.
-//! After validation both sides send SYNC_STEP_1 and answer incoming
-//! SYNC_STEP_1 with SYNC_STEP_2 (the diff against the received state
-//! vector). SYNC_STEP_2 and UPDATE payloads are applied to the scope's
+//! After validation both sides send `SYNC_STEP_1` and answer incoming
+//! `SYNC_STEP_1` with `SYNC_STEP_2` (the diff against the received state
+//! vector). `SYNC_STEP_2` and `UPDATE` payloads are applied to the scope's
 //! document with `origin = peer device id`.
 //!
 //! A peer is reported as connected ([`SyncEvent::PeerConnected`], carrying
@@ -110,10 +110,13 @@ pub const KEEPALIVE_PING_INTERVAL: Duration = Duration::from_secs(15);
 /// time.
 pub const KEEPALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Connection lifecycle notifications the manager pushes to the app loop, one
+/// per `(device id, scope)`. The app uses them to drive its connected-peers
+/// view; the carried [`Scope`] distinguishes the personal clipboard from each
+/// joined room so a peer present in several scopes shows up once per scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
-    /// `device_name` comes from the peer's HELLO, so the app can label a
-    /// peer that connected before (or without) being resolved via mDNS.
+    /// A peer's connection in `scope` became live and proved it accepted us.
     ///
     /// Emitted once the peer's first post-HELLO frame proves it accepted us.
     /// May be emitted for an already-connected peer without an intervening
@@ -121,12 +124,21 @@ pub enum SyncEvent {
     /// `(device id, scope)` takes over the old one (see the crate docs on
     /// takeover).
     PeerConnected {
+        /// Stable id of the peer device, as advertised in its HELLO.
         device_id: String,
+        /// Human-readable label from the peer's HELLO, so the app can name a
+        /// peer that connected before (or without) being resolved via mDNS.
         device_name: String,
+        /// Which shared space this connection syncs; lets the app attribute
+        /// the peer to the personal clipboard or a specific joined room.
         scope: Scope,
     },
+    /// A previously-announced connection in `scope` ended (peer hung up, was
+    /// de-allowed, the room was left, or it was force-closed as wedged).
     PeerDisconnected {
+        /// Stable id of the peer device whose connection ended.
         device_id: String,
+        /// Which shared space the now-ended connection had been syncing.
         scope: Scope,
     },
 }
@@ -225,7 +237,7 @@ impl SyncManager {
         docs: Arc<DocSet>,
         device: DeviceInfo,
         allowed: HashSet<String>,
-        joined_rooms: HashSet<String>,
+        joined_rooms: &HashSet<String>,
     ) -> (Arc<Self>, mpsc::Receiver<SyncEvent>) {
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
         let manager = Arc::new_cyclic(|weak| Self {
@@ -244,7 +256,7 @@ impl SyncManager {
             let mut state = manager.state.lock();
             manager.spawn_fan_out(&mut state, Scope::Devices, devices_doc);
         }
-        for room in &joined_rooms {
+        for room in joined_rooms {
             manager.join_room(room);
         }
         (manager, events_rx)
@@ -282,14 +294,20 @@ impl SyncManager {
             let _ = dialer.cancel.send(());
         }
         if let Some(connection) = connection {
-            self.drop_connection(&key, connection);
+            self.drop_connection(&key, &connection);
         }
     }
 
+    /// Whether `device_id` is on the `devices`-scope allowlist (i.e. we are
+    /// willing to sync the personal clipboard with it).
+    #[must_use]
     pub fn is_allowed(&self, device_id: &str) -> bool {
         self.state.lock().allowed.contains(device_id)
     }
 
+    /// Snapshot of the current `devices`-scope allowlist, for persisting it or
+    /// rendering it in the UI.
+    #[must_use]
     pub fn allowed(&self) -> HashSet<String> {
         self.state.lock().allowed.clone()
     }
@@ -381,7 +399,7 @@ impl SyncManager {
             let _ = dialer.cancel.send(());
         }
         for (key, connection) in connections {
-            self.drop_connection(&key, connection);
+            self.drop_connection(&key, &connection);
         }
     }
 
@@ -472,7 +490,7 @@ impl SyncManager {
 
     /// Tear down a connection handle that has already been removed from the
     /// registry, emitting the disconnect iff the peer had been announced.
-    fn drop_connection(&self, key: &ConnKey, handle: ConnectionHandle) {
+    fn drop_connection(&self, key: &ConnKey, handle: &ConnectionHandle) {
         let _ = handle.hangup.send(true);
         if handle.announced {
             self.emit(SyncEvent::PeerDisconnected {
@@ -494,7 +512,7 @@ impl SyncManager {
             }
         };
         if let Some(handle) = removed {
-            self.drop_connection(key, handle);
+            self.drop_connection(key, &handle);
         }
     }
 

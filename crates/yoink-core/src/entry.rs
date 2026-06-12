@@ -9,14 +9,25 @@ use yrs::Any;
 /// array instead of nested shared types.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClipEntry {
+    /// Stable per-entry UUID, used to address an entry across peers (e.g. for
+    /// [`crate::AppCommand::CopyEntry`]).
     pub id: String,
+    /// Id of the device that created the entry; matched against the allowlist.
     pub device_id: String,
+    /// Display name of the creating device at creation time (may go stale if
+    /// the device later renames itself).
     pub device_name: String,
+    /// The clipboard contents.
     pub text: String,
+    /// Creation time in unix milliseconds. A display-ordering hint only; CRDT
+    /// ordering is authoritative (see [`now_ms`]).
     pub created_at_ms: u64,
 }
 
 impl ClipEntry {
+    /// Build an entry stamped with a fresh UUID, the device's identity, and
+    /// the current wall-clock time.
+    #[must_use]
     pub fn new(device: &DeviceInfo, text: String) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
@@ -41,7 +52,7 @@ impl ClipEntry {
         map.insert("text".into(), Any::String(self.text.as_str().into()));
         map.insert(
             "created_at_ms".into(),
-            Any::BigInt(self.created_at_ms as i64),
+            Any::BigInt(self.created_at_ms.cast_signed()),
         );
         Any::Map(Arc::new(map))
     }
@@ -53,7 +64,12 @@ impl ClipEntry {
             _ => None,
         };
         let created_at_ms = match map.get("created_at_ms") {
-            Some(Any::BigInt(n)) => *n as u64,
+            Some(Any::BigInt(n)) => n.cast_unsigned(),
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "lossy fallback decode of a foreign JSON-style number into a millisecond timestamp; precision loss is acceptable since created_at_ms is only an ordering hint"
+            )]
             Some(Any::Number(n)) => *n as u64,
             _ => 0,
         };
@@ -69,9 +85,10 @@ impl ClipEntry {
 
 /// Milliseconds since the unix epoch. Used only for display ordering hints;
 /// CRDT ordering is what actually governs the history.
+#[must_use]
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }

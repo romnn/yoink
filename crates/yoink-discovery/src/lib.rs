@@ -36,26 +36,40 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// A peer yoink instance discovered on the local network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
+    /// Stable device identity from the peer's TXT `id`. The dedup/identity key
+    /// across re-resolves and instance renames; also used to filter out our
+    /// own announcement.
     pub device_id: String,
+    /// Human-readable display name from the peer's TXT `name`; falls back to
+    /// `device_id` when the peer omits it (e.g. a v1 peer).
     pub name: String,
     /// All addresses the peer's mDNS announcement resolved to.
     pub addrs: Vec<IpAddr>,
+    /// Sync port from the peer's SRV record; the port to dial to connect.
     pub port: u16,
     /// Room names the peer advertises (sorted, deduplicated). Drives the
     /// "rooms on this network" UI and room-scope dialing.
     pub rooms: Vec<String>,
 }
 
+/// A change in peer presence emitted to the discovery consumer.
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
     /// A peer appeared or its announcement changed (re-resolved).
     Found(PeerInfo),
     /// A peer's announcement disappeared from the network.
-    Lost { device_id: String },
+    Lost {
+        /// Identity of the peer that was lost, matching the `device_id` of the
+        /// [`PeerInfo`] previously delivered via [`DiscoveryEvent::Found`].
+        device_id: String,
+    },
 }
 
+/// Errors that can arise while starting or driving discovery.
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
+    /// The underlying mDNS daemon failed (e.g. it could not bind its sockets
+    /// or construct/register the service info).
     #[error("mdns error: {0}")]
     Mdns(#[from] mdns_sd::Error),
 }
@@ -67,7 +81,7 @@ pub struct Discovery {
     daemon: ServiceDaemon,
     /// Fullname of our own registration, needed to unregister on shutdown.
     fullname: String,
-    /// Everything needed to rebuild the ServiceInfo when the advertised
+    /// Everything needed to rebuild the `ServiceInfo` when the advertised
     /// rooms change (mdns-sd updates an announcement by re-registering the
     /// same fullname).
     registration: Registration,
@@ -114,6 +128,12 @@ impl Discovery {
     ///
     /// Must be called from within a tokio runtime (it spawns the task that
     /// bridges daemon events into the returned channel).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DiscoveryError::Mdns`] if the mDNS daemon cannot be created,
+    /// the service info cannot be built from the given identity/rooms, or the
+    /// initial registration or browse fails.
     ///
     /// Implementation notes:
     /// - Instance name must be unique per device: use `"{device_name}-{first

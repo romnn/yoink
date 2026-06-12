@@ -64,20 +64,20 @@ impl WatchState {
 mod tests {
     use super::*;
 
-    fn copied(text: &str) -> Option<ClipboardEvent> {
-        Some(ClipboardEvent::Copied(text.to_owned()))
+    fn copied(text: &str) -> ClipboardEvent {
+        ClipboardEvent::Copied(text.to_owned())
     }
 
     #[test]
     fn first_observation_emits() {
         let mut state = WatchState::new();
-        assert_eq!(state.observe("hello".into()), copied("hello"));
+        assert_eq!(state.observe("hello".into()), Some(copied("hello")));
     }
 
     #[test]
     fn repeated_observation_is_silent() {
         let mut state = WatchState::new();
-        assert_eq!(state.observe("hello".into()), copied("hello"));
+        assert_eq!(state.observe("hello".into()), Some(copied("hello")));
         assert_eq!(state.observe("hello".into()), None);
         assert_eq!(state.observe("hello".into()), None);
     }
@@ -85,9 +85,9 @@ mod tests {
     #[test]
     fn changed_text_emits_again() {
         let mut state = WatchState::new();
-        assert_eq!(state.observe("one".into()), copied("one"));
-        assert_eq!(state.observe("two".into()), copied("two"));
-        assert_eq!(state.observe("one".into()), copied("one"));
+        assert_eq!(state.observe("one".into()), Some(copied("one")));
+        assert_eq!(state.observe("two".into()), Some(copied("two")));
+        assert_eq!(state.observe("one".into()), Some(copied("one")));
     }
 
     #[test]
@@ -95,7 +95,7 @@ mod tests {
         let mut state = WatchState::new();
         state.seed("preexisting".into());
         assert_eq!(state.observe("preexisting".into()), None);
-        assert_eq!(state.observe("fresh".into()), copied("fresh"));
+        assert_eq!(state.observe("fresh".into()), Some(copied("fresh")));
     }
 
     #[test]
@@ -112,9 +112,9 @@ mod tests {
         let mut state = WatchState::new();
         state.record_set("foo".into());
         assert_eq!(state.observe("foo".into()), None);
-        assert_eq!(state.observe("bar".into()), copied("bar"));
+        assert_eq!(state.observe("bar".into()), Some(copied("bar")));
         // The earlier set_text("foo") must not suppress this genuine copy.
-        assert_eq!(state.observe("foo".into()), copied("foo"));
+        assert_eq!(state.observe("foo".into()), Some(copied("foo")));
     }
 
     #[test]
@@ -122,10 +122,10 @@ mod tests {
         let mut state = WatchState::new();
         state.record_set("ours".into());
         // The user copied something before we ever saw our own write land.
-        assert_eq!(state.observe("theirs".into()), copied("theirs"));
+        assert_eq!(state.observe("theirs".into()), Some(copied("theirs")));
         // Our write is gone from the clipboard; a later user copy of the same
         // text is genuine and must emit.
-        assert_eq!(state.observe("ours".into()), copied("ours"));
+        assert_eq!(state.observe("ours".into()), Some(copied("ours")));
     }
 
     #[test]
@@ -138,10 +138,10 @@ mod tests {
     #[test]
     fn whitespace_observation_updates_baseline_without_emitting() {
         let mut state = WatchState::new();
-        assert_eq!(state.observe("real".into()), copied("real"));
+        assert_eq!(state.observe("real".into()), Some(copied("real")));
         assert_eq!(state.observe("  ".into()), None);
         // The clipboard genuinely changed back to "real", so it emits again.
-        assert_eq!(state.observe("real".into()), copied("real"));
+        assert_eq!(state.observe("real".into()), Some(copied("real")));
     }
 
     #[test]

@@ -137,8 +137,8 @@ async fn dial_loop(
     loop {
         if !delay.is_zero() {
             tokio::select! {
-                _ = cancelled(&mut cancel) => return,
-                _ = tokio::time::sleep(delay) => {}
+                () = cancelled(&mut cancel) => return,
+                () = tokio::time::sleep(delay) => {}
             }
         }
         let Some(manager) = manager.upgrade() else {
@@ -151,7 +151,7 @@ async fn dial_loop(
         let stream = tokio::select! {
             // Cancellation means our registry entry is already gone; nothing
             // to clean up.
-            _ = cancelled(&mut cancel) => return,
+            () = cancelled(&mut cancel) => return,
             stream = try_connect(&peer) => stream,
         };
         let outcome = match stream {

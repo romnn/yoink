@@ -1,7 +1,7 @@
 //! Fixture server for eyeballing the UI: the real router and a [`ServerCtx`]
 //! seeded with fake peers, rooms and history, no discovery or clipboard
 //! needed. Run with `cargo run -p yoink-server --example ui_fixture` and open
-//! http://127.0.0.1:7691/ (or `/r/attic` for the room view).
+//! <http://127.0.0.1:7691/> (or `/r/attic` for the room view).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -20,7 +20,7 @@ fn peer(id: &str, name: &str, online: bool, rooms: &[&str]) -> (String, PeerView
                 name: name.into(),
                 addrs: vec![],
                 port: 7679,
-                rooms: rooms.iter().map(|r| r.to_string()).collect(),
+                rooms: rooms.iter().map(ToString::to_string).collect(),
             },
             online,
         },
@@ -65,12 +65,8 @@ async fn main() -> anyhow::Result<()> {
 
     let allowed: HashSet<String> = ["dev-mac".to_string(), "dev-ghost".to_string()].into();
     let joined: BTreeSet<String> = ["attic".to_string()].into();
-    let (sync, _events) = SyncManager::new(
-        docs.clone(),
-        device.clone(),
-        allowed,
-        joined.iter().cloned().collect(),
-    );
+    let joined_rooms: HashSet<String> = joined.iter().cloned().collect();
+    let (sync, _events) = SyncManager::new(docs.clone(), device.clone(), allowed, &joined_rooms);
 
     let peers: HashMap<String, PeerView> = [
         peer("dev-mac", "mac-studio", true, &["attic", "standup"]),
