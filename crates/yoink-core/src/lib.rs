@@ -6,10 +6,12 @@
 
 mod doc;
 mod entry;
+mod mode;
 mod scope;
 
 pub use doc::{ClipDoc, DocError, DocUpdate};
 pub use entry::{ClipEntry, now_ms};
+pub use mode::ShareMode;
 pub use scope::{DocSet, InvalidScope, MAX_ROOM_NAME_LEN, Scope, sanitize_room_name};
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +29,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_HISTORY: u32 = 200;
 
 /// Identity a peer announces over the wire: who is sending updates and how to
-/// present them in another device's history and allowlist UI.
+/// present them in another device's history and device-management UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     /// Stable unique id (UUID) persisted in the device's config.
@@ -42,20 +44,18 @@ pub struct DeviceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum AppCommand {
-    /// Add or remove a peer from the personal-clipboard allowlist. Only
-    /// allowlisted devices may feed the `Devices` scope.
-    SetAllowed {
-        /// Peer whose allowlist membership is being toggled.
+    /// Change whether a device is trusted for the personal-clipboard
+    /// (`Devices`) scope. Under the default trust-the-LAN model `trusted =
+    /// false` blocks the device and `true` unblocks it; under
+    /// `--require-pairing` the same flag pairs (`true`) or unpairs (`false`)
+    /// it. The event loop routes it to the right list based on the active
+    /// model.
+    SetDeviceTrusted {
+        /// Peer whose trust state is being changed.
         device_id: String,
-        /// `true` to admit the peer, `false` to revoke it.
-        allowed: bool,
-    },
-    /// Toggle whether incoming personal-clipboard entries are written to the
-    /// OS clipboard automatically.
-    SetAutoApply {
-        /// `true` to auto-apply received entries, `false` to leave them in
-        /// history only.
-        enabled: bool,
+        /// `true` to trust (unblock / pair), `false` to distrust (block /
+        /// unpair).
+        trusted: bool,
     },
     /// Append text the user typed in the UI as a new entry in `scope`.
     AddEntry {

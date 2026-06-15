@@ -6,10 +6,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use yoink_core::{DeviceInfo, DocSet, Scope};
+use yoink_core::{DeviceInfo, DocSet, Scope, ShareMode};
 use yoink_discovery::PeerInfo;
 use yoink_server::{PeerView, ServerCtx, Settings, serve};
-use yoink_sync::SyncManager;
+use yoink_sync::{SyncManager, TrustSettings};
 
 fn peer(id: &str, name: &str, online: bool, rooms: &[&str]) -> (String, PeerView) {
     (
@@ -63,10 +63,16 @@ async fn main() -> anyhow::Result<()> {
         "docker compose -f deploy/compose.yaml up -d".into(),
     );
 
-    let allowed: HashSet<String> = ["dev-mac".to_string(), "dev-ghost".to_string()].into();
+    // Default trust model: block a couple of devices to exercise the blocked
+    // (and blocked-but-offline "dev-ghost") row states in the UI.
+    let blocked: HashSet<String> = ["dev-pi".to_string(), "dev-ghost".to_string()].into();
     let joined: BTreeSet<String> = ["attic".to_string()].into();
     let joined_rooms: HashSet<String> = joined.iter().cloned().collect();
-    let (sync, _events) = SyncManager::new(docs.clone(), device.clone(), allowed, &joined_rooms);
+    let trust = TrustSettings {
+        blocked,
+        ..TrustSettings::default()
+    };
+    let (sync, _events) = SyncManager::new(docs.clone(), device.clone(), trust, &joined_rooms);
 
     let peers: HashMap<String, PeerView> = [
         peer("dev-mac", "mac-studio", true, &["attic", "standup"]),
@@ -86,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
         sync,
         peers: Arc::new(parking_lot::RwLock::new(peers)),
         settings: Arc::new(parking_lot::RwLock::new(Settings {
-            auto_apply: true,
+            mode: ShareMode::AutoShare,
             clipboard_available: true,
         })),
         joined_rooms: Arc::new(parking_lot::RwLock::new(joined)),

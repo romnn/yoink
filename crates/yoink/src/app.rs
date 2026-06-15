@@ -1,13 +1,16 @@
 //! The app event loop: single owner of doc writes, clipboard writes and
 //! config persistence. Everything else (server, sync, discovery) feeds
 //! events or commands into it through channels.
+//!
+//! Clipboard history is deliberately **not** persisted: restarting yoink
+//! clears every scope's history. Only the config (device id, name, the
+//! paired/blocked device lists and joined-room names) is written to disk.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use tokio::sync::{broadcast, mpsc};
 use yoink_clipboard::{ClipboardEvent, ClipboardHandle};
 use yoink_core::{AppCommand, ClipDoc, DeviceInfo, DocSet, DocUpdate, Scope, sanitize_room_name};
@@ -15,7 +18,7 @@ use yoink_discovery::{Discovery, DiscoveryEvent, PeerInfo};
 use yoink_server::PeerView;
 use yoink_sync::{SyncEvent, SyncManager};
 
-use crate::config::{self, Config};
+use crate::config::Config;
 
 /// How many of the newest history entries a freshly observed clipboard copy
 /// is deduplicated against. Checking only the latest entry is not enough:
@@ -50,8 +53,8 @@ pub(crate) const AUTO_APPLY_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// Inputs for deciding whether the latest entry of a remotely-originated doc
 /// update should be written to the OS clipboard. Only ever evaluated for the
-/// `devices` scope: rooms never touch the OS clipboard passively, no matter
-/// what arrives in them (DESIGN.md).
+/// `devices` scope in `mirror` mode: rooms never touch the OS clipboard
+/// passively, and the other modes never auto-apply (DESIGN.md).
 pub(crate) struct AutoApplyCheck<'a> {
     pub auto_apply: bool,
     pub clipboard_available: bool,
@@ -79,7 +82,7 @@ impl AutoApplyCheck<'_> {
 
 /// What `AppCommand::AddEntry` does besides appending to the scope's doc.
 /// Devices adds mirror the text into the local clipboard so a paste right
-/// after "add" does what users expect; room adds never do — sharing into a
+/// after "Share" does what users expect; room adds never do — sharing into a
 /// room is not a copy, and rooms must not touch the OS clipboard implicitly.
 pub(crate) struct AddEntryPlan {
     pub add_to_doc: bool,
@@ -93,16 +96,12 @@ pub(crate) fn plan_add_entry(scope: &Scope, duplicate_of_latest: bool) -> AddEnt
     }
 }
 
-/// Registry policy when a peer's mDNS announcement disappears: allowed peers
-/// stay (flipped offline) so the UI can still show their name and offer
-/// revoke, while never-allowed strangers are removed — otherwise they would
-/// linger as dead rows forever.
-pub(crate) fn registry_on_lost(
-    peers: &mut HashMap<String, PeerView>,
-    device_id: &str,
-    allowed: bool,
-) {
-    if allowed {
+/// Registry policy when a peer's mDNS announcement disappears: peers worth
+/// keeping (a live connection, or an explicit paired/blocked listing so the
+/// user can still act on them) flip offline; everyone else is removed so
+/// transient strangers don't linger as dead rows forever.
+pub(crate) fn registry_on_lost(peers: &mut HashMap<String, PeerView>, device_id: &str, keep: bool) {
+    if keep {
         if let Some(view) = peers.get_mut(device_id) {
             view.online = false;
         }
@@ -151,79 +150,6 @@ impl BackgroundWrite {
     }
 }
 
-/// Per-scope snapshot persistence: each open doc gets its own file, dirty
-/// flag and single-writer [`BackgroundWrite`], so the existing reap/retry
-/// discipline applies per file.
-pub(crate) struct SnapshotState {
-    pub path: PathBuf,
-    pub dirty: bool,
-    pub write: BackgroundWrite,
-}
-
-impl SnapshotState {
-    pub(crate) fn clean(path: PathBuf) -> Self {
-        Self {
-            path,
-            dirty: false,
-            write: BackgroundWrite::idle(),
-        }
-    }
-}
-
-/// Where `scope`'s snapshot lives: the devices doc keeps its historical
-/// `state.bin` location, each room snapshots to `rooms/{name}.bin`. Room
-/// names are sanitized (lowercase ASCII alphanumerics and hyphens), so they
-/// are safe as file names.
-pub(crate) fn snapshot_path(config_dir: &Path, scope: &Scope) -> PathBuf {
-    match scope.room_name() {
-        None => config_dir.join("state.bin"),
-        Some(name) => config_dir.join("rooms").join(format!("{name}.bin")),
-    }
-}
-
-/// Atomic snapshot write plus lazy parent-directory creation: `rooms/` only
-/// comes into existence once the first room snapshot is written.
-pub(crate) fn write_snapshot(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create snapshot directory {}", parent.display()))?;
-    }
-    config::write_atomic(path, bytes)
-}
-
-/// Restore `scope`'s doc from its snapshot file and register it in `docs`.
-///
-/// The snapshot is applied INTO the registered doc (a CRDT merge) rather
-/// than inserted as a fresh doc: the devices scope always pre-exists in a
-/// `DocSet`, so an insert-unless-present would silently discard the loaded
-/// history and keep the empty pre-created doc. Merging also makes a
-/// double-join race harmless — both snapshots simply converge.
-pub(crate) fn restore_doc(docs: &DocSet, scope: &Scope, path: &Path) -> Arc<ClipDoc> {
-    let doc = docs.get_or_create(scope);
-    match std::fs::read(path) {
-        Ok(snapshot) => {
-            // Clipboard history is expendable, so unlike the config a
-            // corrupt snapshot only warns and starts fresh.
-            if let Err(err) = doc.apply_update(&snapshot, None) {
-                tracing::warn!(
-                    error = %err,
-                    path = %path.display(),
-                    "snapshot file is corrupt; starting with an empty history",
-                );
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                path = %path.display(),
-                "failed to read snapshot file; starting with an empty history",
-            );
-        }
-    }
-    doc
-}
-
 /// What a per-scope forwarder feeds into the loop's merged doc channel.
 pub(crate) enum DocEvent {
     Update {
@@ -231,11 +157,8 @@ pub(crate) enum DocEvent {
         update: DocUpdate,
     },
     /// The forwarder's broadcast receiver lagged: updates were lost, so the
-    /// scope's snapshot must be re-marked dirty and the UI refreshed even
-    /// though no update payload is available.
-    Lagged {
-        scope: Scope,
-    },
+    /// UI is refreshed (it rebuilds the history from the doc regardless).
+    Lagged,
 }
 
 /// Spawn the task forwarding `doc`'s update stream into the merged channel,
@@ -264,14 +187,8 @@ async fn forward_doc_updates(
                 update,
             },
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    skipped,
-                    %scope,
-                    "doc update receiver lagged; forcing snapshot and UI refresh",
-                );
-                DocEvent::Lagged {
-                    scope: scope.clone(),
-                }
+                tracing::warn!(skipped, %scope, "doc update receiver lagged; forcing UI refresh");
+                DocEvent::Lagged
             }
             // The doc outlives its forwarder for every scope we sync, so a
             // closed stream means the doc was dropped (room left) and the
@@ -286,36 +203,27 @@ async fn forward_doc_updates(
     }
 }
 
-/// Restore every persisted scope's doc and wire its update forwarder, used by
+/// Create every scope's (empty) doc and wire its update forwarder, used by
 /// `main` to seed the loop's [`App`] before sync or the server exist. The
-/// `devices` scope is always restored first, followed by every joined room;
-/// doing this up front guarantees no update slips past the loop and that sync
-/// joins the restored room docs instead of creating empty ones.
-///
-/// Returns the per-scope forwarder handles and clean (not-yet-dirty) snapshot
-/// states, both keyed by scope, ready to be moved into the [`App`].
-pub(crate) fn restore_scopes(
+/// `devices` scope comes first, followed by every joined room; doing this up
+/// front guarantees no update slips past the loop and that sync joins these
+/// docs instead of creating empty ones of its own. History is never restored
+/// from disk — yoink starts every run with empty scopes.
+pub(crate) fn wire_scopes(
     docs: &DocSet,
-    config_dir: &Path,
     rooms: &[String],
     doc_events_tx: &mpsc::Sender<DocEvent>,
-) -> (
-    HashMap<Scope, tokio::task::JoinHandle<()>>,
-    HashMap<Scope, SnapshotState>,
-) {
+) -> HashMap<Scope, tokio::task::JoinHandle<()>> {
     let mut forwarders = HashMap::new();
-    let mut snapshots = HashMap::new();
     let scopes = std::iter::once(Scope::Devices).chain(rooms.iter().map(Scope::room));
     for scope in scopes {
-        let path = snapshot_path(config_dir, &scope);
-        let doc = restore_doc(docs, &scope, &path);
+        let doc = docs.get_or_create(&scope);
         forwarders.insert(
             scope.clone(),
             spawn_doc_forwarder(scope.clone(), &doc, doc_events_tx.clone()),
         );
-        snapshots.insert(scope, SnapshotState::clean(path));
     }
-    (forwarders, snapshots)
+    forwarders
 }
 
 /// All receivers the loop selects over, handed in by `main` after wiring.
@@ -336,6 +244,13 @@ pub(crate) struct App {
     pub docs: Arc<DocSet>,
     pub device: DeviceInfo,
     pub clipboard: ClipboardHandle,
+    /// Whether OS-clipboard copies are captured into the devices doc
+    /// (`auto-share`/`mirror` modes). False in the default manual mode, where
+    /// nothing the user copies is shared automatically.
+    pub auto_capture: bool,
+    /// Whether received personal-clipboard entries are written to the OS
+    /// clipboard automatically (`mirror` mode only).
+    pub auto_apply: bool,
     pub sync: Arc<SyncManager>,
     pub discovery: Discovery,
     pub peers: Arc<parking_lot::RwLock<HashMap<String, PeerView>>>,
@@ -349,9 +264,6 @@ pub(crate) struct App {
     /// Id of the last remote entry written to the OS clipboard, so a peer
     /// resending the same state never re-applies it.
     pub last_applied_entry_id: Option<String>,
-    /// One snapshot file per open scope; entries come and go with
-    /// join/leave, the `Devices` entry lives as long as the loop.
-    pub snapshots: HashMap<Scope, SnapshotState>,
     pub config_dirty: bool,
     pub config_write: BackgroundWrite,
     /// Sender side of the merged doc channel, kept so `JoinRoom` can wire up
@@ -377,8 +289,8 @@ impl App {
                 Some(event) = ch.doc.recv() => self.on_doc_event(event),
                 Some(event) = ch.discovery.recv() => self.on_discovery(event),
                 Some(event) = ch.sync.recv() => self.on_sync(&event),
-                Some(command) = ch.command.recv() => self.on_command(command).await,
-                _ = flush.tick() => self.flush_dirty().await,
+                Some(command) = ch.command.recv() => self.on_command(command),
+                _ = flush.tick() => self.flush_config().await,
                 result = &mut ctrl_c => {
                     if let Err(err) = result {
                         tracing::error!(error = %err, "failed to listen for ctrl-c; shutting down");
@@ -389,28 +301,9 @@ impl App {
         }
 
         tracing::info!("shutting down");
-        // Settle in-flight background writes first so the final writes below
-        // can never race them over the same tmp files. Blocking the loop is
-        // fine here: there is nothing left to consume.
-        for (scope, snapshot) in &mut self.snapshots {
-            if let Err(err) = snapshot.write.reap().await {
-                snapshot.dirty = true;
-                tracing::warn!(error = %err, %scope, "in-flight snapshot write failed during shutdown");
-            }
-            if !snapshot.dirty {
-                continue;
-            }
-            let Some(doc) = self.docs.get(scope) else {
-                continue;
-            };
-            if let Err(err) = write_snapshot(&snapshot.path, &doc.snapshot()) {
-                tracing::warn!(
-                    error = %err,
-                    path = %snapshot.path.display(),
-                    "failed to write doc snapshot on shutdown",
-                );
-            }
-        }
+        // Clipboard history is intentionally not persisted; only the config
+        // is. Settle any in-flight config write before the final one so they
+        // cannot race over the same tmp file.
         if let Err(err) = self.config_write.reap().await {
             self.config_dirty = true;
             tracing::error!(error = %err, "in-flight config write failed during shutdown");
@@ -425,40 +318,42 @@ impl App {
     }
 
     fn on_clipboard(&mut self, event: ClipboardEvent) {
+        // Only auto-share/mirror modes capture OS-clipboard copies; in the
+        // default manual mode nothing the user copies is shared — they share
+        // explicitly through the UI (DESIGN.md).
+        if !self.auto_capture {
+            return;
+        }
         let ClipboardEvent::Copied(text) = event;
         // Clipboard capture is hard-wired to the devices scope: the OS
-        // clipboard never feeds a room (DESIGN.md).
+        // clipboard never feeds a room.
         let devices = self.docs.devices();
         if is_duplicate(&text, &recent_texts(&devices, COPY_DEDUPE_WINDOW)) {
             return;
         }
         // The resulting doc update comes back through our own subscription,
-        // which marks the snapshot dirty and notifies the UI.
+        // which notifies the UI.
         devices.add_entry(&self.device, text);
     }
 
     fn on_doc_event(&mut self, event: DocEvent) {
         match event {
             DocEvent::Update { scope, update } => self.on_doc_update(&scope, &update),
-            DocEvent::Lagged { scope } => {
-                self.mark_snapshot_dirty(&scope);
-                self.notify_ui();
-            }
+            DocEvent::Lagged => self.notify_ui(),
         }
     }
 
     fn on_doc_update(&mut self, scope: &Scope, update: &DocUpdate) {
-        self.mark_snapshot_dirty(scope);
-        // Auto-apply is exclusive to the devices scope: a room update never
-        // touches the OS clipboard passively, no matter who sent it —
-        // copying out of a room is always a deliberate `CopyEntry`.
+        // Auto-apply is exclusive to the devices scope and only in `mirror`
+        // mode (gated by `auto_apply`): a room update never touches the OS
+        // clipboard passively, no matter who sent it — copying out of a room
+        // is always a deliberate `CopyEntry`.
         if scope.is_devices()
             && update.origin.is_some()
             && let Some(entry) = self.docs.devices().latest()
         {
-            let auto_apply = self.settings.read().auto_apply;
             let check = AutoApplyCheck {
-                auto_apply,
+                auto_apply: self.auto_apply,
                 clipboard_available: self.clipboard.available(),
                 self_device_id: &self.device.id,
                 entry_device_id: &entry.device_id,
@@ -473,15 +368,6 @@ impl App {
             }
         }
         self.notify_ui();
-    }
-
-    fn mark_snapshot_dirty(&mut self, scope: &Scope) {
-        if let Some(snapshot) = self.snapshots.get_mut(scope) {
-            snapshot.dirty = true;
-        }
-        // A missing entry means the scope was left while one of its updates
-        // was still queued; the final snapshot was already flushed by
-        // `leave_room`, so there is nothing left to persist.
     }
 
     fn on_discovery(&mut self, event: DiscoveryEvent) {
@@ -499,11 +385,13 @@ impl App {
             }
             DiscoveryEvent::Lost { device_id } => {
                 tracing::info!(%device_id, "peer lost");
-                registry_on_lost(
-                    &mut self.peers.write(),
-                    &device_id,
-                    self.sync.is_allowed(&device_id),
-                );
+                // Keep a peer in the registry while it still has a live
+                // connection (mDNS flaps don't drop a working socket) or is
+                // explicitly listed (paired/blocked), so the UI can still act
+                // on it; drop anyone else so strangers don't pile up.
+                let keep = self.sync.is_explicitly_listed(&device_id)
+                    || self.sync.connected(&Scope::Devices).contains(&device_id);
+                registry_on_lost(&mut self.peers.write(), &device_id, keep);
                 self.sync.peer_lost(&device_id);
             }
         }
@@ -522,7 +410,7 @@ impl App {
                 // — e.g. it dialed us right after we restarted. Seed the
                 // registry from the HELLO so the UI never shows a bare id.
                 // Only the devices scope seeds: the peer registry is the
-                // pairing UI, and a room peer may be a total stranger there.
+                // device-management UI, and a room peer may be a stranger there.
                 if scope.is_devices() {
                     let mut peers = self.peers.write();
                     peers
@@ -550,23 +438,11 @@ impl App {
         self.notify_ui();
     }
 
-    async fn on_command(&mut self, command: AppCommand) {
+    fn on_command(&mut self, command: AppCommand) {
         match command {
-            AppCommand::SetAllowed { device_id, allowed } => {
-                self.sync.set_allowed(&device_id, allowed);
-                if allowed {
-                    if !self.config.allowed.contains(&device_id) {
-                        self.config.allowed.push(device_id);
-                    }
-                } else {
-                    self.config.allowed.retain(|id| id != &device_id);
-                }
-                self.persist_config();
-                self.notify_ui();
-            }
-            AppCommand::SetAutoApply { enabled } => {
-                self.settings.write().auto_apply = enabled;
-                self.config.auto_apply = enabled;
+            AppCommand::SetDeviceTrusted { device_id, trusted } => {
+                self.sync.set_trusted(&device_id, trusted);
+                self.persist_trust(&device_id, trusted);
                 self.persist_config();
                 self.notify_ui();
             }
@@ -586,7 +462,7 @@ impl App {
                     doc.add_entry(&self.device, text.clone());
                 }
                 // Mirror the shared entry into the sharing device's own
-                // clipboard so a paste right after "add" does what users
+                // clipboard so a paste right after "Share" does what users
                 // expect — even when the duplicate entry itself was skipped.
                 // Room adds never mirror: sharing into a room is not a copy.
                 if plan.mirror_to_clipboard {
@@ -607,7 +483,28 @@ impl App {
                 }
             }
             AppCommand::JoinRoom { name } => self.join_room(&name),
-            AppCommand::LeaveRoom { name } => self.leave_room(&name).await,
+            AppCommand::LeaveRoom { name } => self.leave_room(&name),
+        }
+    }
+
+    /// Record a trust change in the config list the active model consults:
+    /// the paired list under `--require-pairing`, the blocked list otherwise.
+    fn persist_trust(&mut self, device_id: &str, trusted: bool) {
+        let require_pairing = self.sync.require_pairing();
+        let list = if require_pairing {
+            &mut self.config.allowed
+        } else {
+            &mut self.config.blocked
+        };
+        // The list stores the *explicit* members: paired devices when
+        // pairing, blocked devices otherwise. So a device joins the list when
+        // (require_pairing == trusted) and leaves it otherwise.
+        if require_pairing == trusted {
+            if !list.contains(&device_id.to_string()) {
+                list.push(device_id.to_string());
+            }
+        } else {
+            list.retain(|id| id != device_id);
         }
     }
 
@@ -623,23 +520,15 @@ impl App {
             return;
         }
         let scope = Scope::room(&name);
-        let path = snapshot_path(&self.config_dir, &scope);
-        // A previous membership may have left a snapshot behind; rejoining
-        // restores that history. Register the doc and its forwarder before
-        // `sync.join_room`, so sync finds the restored doc (instead of
-        // creating an empty one) and no early peer update slips past the
-        // loop.
-        let doc = restore_doc(&self.docs, &scope, &path);
+        // Register the doc and its forwarder before `sync.join_room`, so sync
+        // finds the doc (instead of creating an empty one) and no early peer
+        // update slips past the loop. The doc starts empty — room history is
+        // not persisted.
+        let doc = self.docs.get_or_create(&scope);
         self.forwarders.insert(
             scope.clone(),
             spawn_doc_forwarder(scope.clone(), &doc, self.doc_events_tx.clone()),
         );
-        let mut snapshot = SnapshotState::clean(path);
-        // Materialize the room's file on the next flush tick even before any
-        // entry exists, so join/leave/rejoin behaves the same with or
-        // without traffic.
-        snapshot.dirty = true;
-        self.snapshots.insert(scope, snapshot);
         self.sync.join_room(&name);
         self.joined_rooms.write().insert(name.clone());
         if let Err(pos) = self.config.rooms.binary_search(&name) {
@@ -650,7 +539,7 @@ impl App {
         self.notify_ui();
     }
 
-    async fn leave_room(&mut self, name: &str) {
+    fn leave_room(&mut self, name: &str) {
         // Sanitize for symmetry with join: the UI may echo back whatever
         // form it had.
         let Some(name) = sanitize_room_name(name) else {
@@ -662,36 +551,11 @@ impl App {
             return;
         }
         let scope = Scope::room(&name);
-        // Order matters: stop sync (hangs up the room's connections) and the
-        // forwarder first, so the doc is quiescent when the final snapshot
-        // is taken.
+        // Stop sync (hangs up the room's connections) and the forwarder, then
+        // drop the doc. Nothing is persisted — leaving discards the history.
         self.sync.leave_room(&name);
         if let Some(forwarder) = self.forwarders.remove(&scope) {
             forwarder.abort();
-        }
-        if let Some(mut snapshot) = self.snapshots.remove(&scope) {
-            // Settle any in-flight write before the final one so they cannot
-            // race over the same tmp file; then write synchronously. The
-            // file is deliberately kept on disk — rejoining restores the
-            // room's history.
-            if let Err(err) = snapshot.write.reap().await {
-                tracing::warn!(error = %err, room = %name, "in-flight room snapshot write failed on leave");
-            }
-            if let Some(doc) = self.docs.get(&scope) {
-                let bytes = doc.snapshot();
-                let path = snapshot.path;
-                let written =
-                    tokio::task::spawn_blocking(move || write_snapshot(&path, &bytes)).await;
-                match written {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        tracing::warn!(error = %err, room = %name, "failed to write final room snapshot on leave");
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, room = %name, "final room snapshot write panicked");
-                    }
-                }
-            }
         }
         self.docs.remove(&scope);
         self.joined_rooms.write().remove(&name);
@@ -708,45 +572,8 @@ impl App {
         self.config_dirty = true;
     }
 
-    /// Persist whatever is dirty. Each write runs on the blocking pool and
+    /// Persist the config if dirty. The write runs on the blocking pool and
     /// is reaped on a later tick; nothing here blocks the event loop.
-    async fn flush_dirty(&mut self) {
-        self.flush_snapshots().await;
-        self.flush_config().await;
-    }
-
-    async fn flush_snapshots(&mut self) {
-        for (scope, snapshot) in &mut self.snapshots {
-            if snapshot.write.in_flight() {
-                // Still writing (slow disk); the dirty flag survives to the
-                // next tick, so nothing is lost by waiting.
-                continue;
-            }
-            if let Err(err) = snapshot.write.reap().await {
-                snapshot.dirty = true;
-                tracing::warn!(
-                    error = %err,
-                    path = %snapshot.path.display(),
-                    "failed to write doc snapshot; will retry",
-                );
-            }
-            if !snapshot.dirty {
-                continue;
-            }
-            let Some(doc) = self.docs.get(scope) else {
-                // The scope's doc is gone (unreachable in practice: leaving
-                // a room removes its snapshot entry in the same handler);
-                // nothing can be persisted for it anymore.
-                snapshot.dirty = false;
-                continue;
-            };
-            let bytes = doc.snapshot();
-            let path = snapshot.path.clone();
-            snapshot.dirty = false;
-            snapshot.write.start(move || write_snapshot(&path, &bytes));
-        }
-    }
-
     async fn flush_config(&mut self) {
         if self.config_write.in_flight() {
             return;
@@ -810,24 +637,6 @@ mod tests {
         DeviceInfo {
             id: id.into(),
             name: format!("device-{id}"),
-        }
-    }
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            Self(std::env::temp_dir().join(format!("yoink-app-test-{}", uuid::Uuid::new_v4())))
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -942,83 +751,6 @@ mod tests {
         assert!(fresh.mirror_to_clipboard);
     }
 
-    #[test]
-    fn snapshot_paths_per_scope() {
-        let dir = Path::new("/cfg");
-        assert_eq!(
-            snapshot_path(dir, &Scope::Devices),
-            PathBuf::from("/cfg/state.bin")
-        );
-        assert_eq!(
-            snapshot_path(dir, &Scope::room("standup")),
-            PathBuf::from("/cfg/rooms/standup.bin")
-        );
-    }
-
-    #[test]
-    fn join_leave_rejoin_restores_room_history() {
-        let dir = TempDir::new();
-        let docs = DocSet::new();
-        let scope = Scope::room("attic");
-        let path = snapshot_path(dir.path(), &scope);
-
-        // Join: no snapshot on disk yet, so the room starts empty.
-        let doc = restore_doc(&docs, &scope, &path);
-        assert!(doc.entries().is_empty());
-        doc.add_entry(&device("d1"), "shared into room".into());
-
-        // Leave: the final flush creates `rooms/` lazily and keeps the file;
-        // the doc itself is dropped from the set.
-        write_snapshot(&path, &doc.snapshot()).unwrap();
-        drop(doc);
-        docs.remove(&scope);
-        assert!(path.exists(), "snapshot file survives leaving the room");
-        assert!(docs.get(&scope).is_none());
-
-        // Rejoin: history is restored from the kept snapshot.
-        let doc = restore_doc(&docs, &scope, &path);
-        let entries = doc.entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].text, "shared into room");
-    }
-
-    #[test]
-    fn devices_snapshot_restores_into_the_preexisting_doc() {
-        // Regression: Scope::Devices always pre-exists in a DocSet, so an
-        // insert-unless-present restore silently discarded the loaded
-        // history and history vanished on every restart.
-        let dir = TempDir::new();
-        let path = snapshot_path(dir.path(), &Scope::Devices);
-
-        let snapshot = {
-            let doc = ClipDoc::new();
-            doc.add_entry(&device("d1"), "persisted across restart".into());
-            doc.snapshot()
-        };
-        write_snapshot(&path, &snapshot).unwrap();
-
-        let docs = DocSet::new();
-        let doc = restore_doc(&docs, &Scope::Devices, &path);
-        assert_eq!(doc.entries().len(), 1);
-        assert_eq!(doc.entries()[0].text, "persisted across restart");
-        assert!(Arc::ptr_eq(&doc, &docs.devices()));
-    }
-
-    #[test]
-    fn corrupt_room_snapshot_starts_fresh() {
-        let dir = TempDir::new();
-        let path = snapshot_path(dir.path(), &Scope::room("attic"));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"not a yrs update").unwrap();
-
-        let docs = DocSet::new();
-        let doc = restore_doc(&docs, &Scope::room("attic"), &path);
-        assert!(doc.entries().is_empty());
-        // The corrupt file is left in place for inspection; only a
-        // successful flush replaces it.
-        assert!(path.exists());
-    }
-
     #[tokio::test]
     async fn forwarder_tags_updates_with_their_scope() {
         let (events_tx, mut events_rx) = mpsc::channel(8);
@@ -1035,7 +767,7 @@ mod tests {
                 assert_eq!(event_scope, scope);
                 assert!(update.origin.is_none(), "local add carries no origin");
             }
-            DocEvent::Lagged { .. } => panic!("no lag expected"),
+            DocEvent::Lagged => panic!("no lag expected"),
         }
 
         // Dropping the doc closes its broadcast stream, which ends the
@@ -1088,18 +820,18 @@ mod tests {
     }
 
     #[test]
-    fn lost_allowed_peer_goes_offline_lost_stranger_is_removed() {
+    fn lost_kept_peer_goes_offline_others_are_removed() {
         let mut peers = HashMap::new();
-        peers.insert("friend".to_string(), view("friend", true));
-        peers.insert("stranger".to_string(), view("stranger", true));
+        peers.insert("keep".to_string(), view("keep", true));
+        peers.insert("drop".to_string(), view("drop", true));
 
-        registry_on_lost(&mut peers, "friend", true);
-        registry_on_lost(&mut peers, "stranger", false);
+        registry_on_lost(&mut peers, "keep", true);
+        registry_on_lost(&mut peers, "drop", false);
 
-        assert!(!peers["friend"].online, "allowed peer flips offline");
+        assert!(!peers["keep"].online, "kept peer flips offline");
         assert!(
-            !peers.contains_key("stranger"),
-            "never-allowed stranger is dropped from the registry"
+            !peers.contains_key("drop"),
+            "an unkept peer is dropped from the registry"
         );
 
         // Losing an unknown id is a no-op either way.

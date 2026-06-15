@@ -15,21 +15,18 @@ pub(crate) struct Config {
     /// Optional display-name override; when absent the hostname is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default = "default_auto_apply")]
-    pub auto_apply: bool,
-    /// Device ids we allow syncing with, persisted across restarts.
+    /// Device ids explicitly paired; consulted only under `--require-pairing`.
     #[serde(default)]
     pub allowed: Vec<String>,
-    /// Sanitized names of the rooms this device has joined, kept sorted.
-    /// Rejoined on startup; each room's doc is restored from
-    /// `rooms/{name}.bin`. The serde default keeps configs from before the
-    /// rooms feature loading cleanly.
+    /// Device ids explicitly blocked; consulted in the default trust model.
+    #[serde(default)]
+    pub blocked: Vec<String>,
+    /// Sanitized names of the rooms this device has joined, kept sorted and
+    /// rejoined on startup (room history itself is never persisted). The
+    /// serde default keeps configs from before the rooms feature loading
+    /// cleanly.
     #[serde(default)]
     pub rooms: Vec<String>,
-}
-
-fn default_auto_apply() -> bool {
-    true
 }
 
 impl Config {
@@ -38,7 +35,7 @@ impl Config {
     ///
     /// A config file that exists but fails to parse is a hard error rather
     /// than a silent reset: wiping it would discard the user's device
-    /// identity and allowlist.
+    /// identity and trusted/blocked device lists.
     pub fn load_or_init(dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to create config directory {}", dir.display()))?;
@@ -47,7 +44,7 @@ impl Config {
             Ok(raw) => toml::from_str(&raw).with_context(|| {
                 format!(
                     "config file {} is corrupt; fix it or remove it \
-                     (removing resets the device id and allowlist)",
+                     (removing resets the device id and trusted/blocked device lists)",
                     path.display()
                 )
             }),
@@ -55,8 +52,8 @@ impl Config {
                 let config = Self {
                     device_id: uuid::Uuid::new_v4().to_string(),
                     name: None,
-                    auto_apply: true,
                     allowed: Vec::new(),
+                    blocked: Vec::new(),
                     rooms: Vec::new(),
                 };
                 config.save(dir)?;
@@ -136,8 +133,8 @@ mod tests {
         let created = Config::load_or_init(dir.path()).unwrap();
         assert!(!created.device_id.is_empty());
         assert!(created.name.is_none());
-        assert!(created.auto_apply);
         assert!(created.allowed.is_empty());
+        assert!(created.blocked.is_empty());
         assert!(created.rooms.is_empty());
 
         let reloaded = Config::load_or_init(dir.path()).unwrap();
@@ -151,8 +148,8 @@ mod tests {
         let config = Config {
             device_id: "id-1".into(),
             name: Some("desk".into()),
-            auto_apply: false,
             allowed: vec!["peer-a".into(), "peer-b".into()],
+            blocked: vec!["peer-c".into()],
             rooms: vec!["attic".into(), "standup".into()],
         };
         config.save(dir.path()).unwrap();
@@ -183,8 +180,8 @@ mod tests {
         let config = Config::load_or_init(dir.path()).unwrap();
         assert_eq!(config.device_id, "id-2");
         assert!(config.name.is_none());
-        assert!(config.auto_apply);
         assert!(config.allowed.is_empty());
+        assert!(config.blocked.is_empty());
         assert!(
             config.rooms.is_empty(),
             "a config from before the rooms feature loads with no rooms"

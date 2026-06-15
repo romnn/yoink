@@ -47,7 +47,7 @@ pub(crate) fn router(ctx: ServerCtx) -> Router {
         .route("/{word}", get(bare_room_redirect))
         .layer(middleware::from_fn(require_loopback))
         // Added after the guard layer on purpose: `/sync` must stay reachable
-        // from the LAN; the sync handshake itself enforces the allowlist.
+        // from the LAN; the sync handshake itself enforces device trust.
         .route("/sync", get(sync))
         .with_state(ctx)
 }
@@ -206,9 +206,9 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc};
     use tower::ServiceExt;
-    use yoink_core::{DeviceInfo, DocSet};
+    use yoink_core::{DeviceInfo, DocSet, ShareMode};
     use yoink_discovery::PeerInfo;
-    use yoink_sync::SyncManager;
+    use yoink_sync::{SyncManager, TrustSettings};
 
     /// A full production router around a self-contained [`ServerCtx`].
     /// Must be called from a tokio runtime ([`SyncManager::new`] spawns).
@@ -221,7 +221,7 @@ mod tests {
         let (sync, _events) = SyncManager::new(
             docs.clone(),
             device.clone(),
-            HashSet::new(),
+            TrustSettings::default(),
             &HashSet::new(),
         );
         let (commands, _commands_rx) = mpsc::channel(8);
@@ -232,7 +232,7 @@ mod tests {
             sync,
             peers: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             settings: Arc::new(parking_lot::RwLock::new(Settings {
-                auto_apply: true,
+                mode: ShareMode::Manual,
                 clipboard_available: true,
             })),
             joined_rooms: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),

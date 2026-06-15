@@ -39,9 +39,10 @@
 //! {
 //!   "device": {"id": "...", "name": "..."},
 //!   "scope": "devices",
-//!   "settings": {"auto_apply": true, "clipboard_available": true},
+//!   "settings": {"clipboard_available": true, "mode": "manual",
+//!                "require_pairing": false},
 //!   "peers": [{"id": "...", "name": "...", "online": true,
-//!              "allowed": false, "connected": false}],
+//!              "connected": false, "trusted": true}],
 //!   "rooms": {"joined": ["attic"],
 //!             "network": [{"name": "attic", "devices": 2}]},
 //!   "members": [{"id": "...", "name": "...", "connected": true}],
@@ -51,9 +52,10 @@
 //! ```
 //!
 //! `peers` is always the devices view: the union of currently discovered
-//! peers and allowed-but-offline device ids (so the user can revoke an
-//! offline peer), with `connected` meaning a live `devices`-scope sync
-//! connection regardless of the requested scope. `rooms.network` is the
+//! peers and explicitly-listed (paired or blocked) offline device ids (so the
+//! user can still unpair/unblock one), with `trusted` reflecting the active
+//! model and `connected` meaning a live `devices`-scope sync connection
+//! regardless of the requested scope. `rooms.network` is the
 //! union of rooms advertised by online peers and our own joined rooms,
 //! `devices` counting the online peers advertising each (0 is possible for
 //! a room only we hold). `members` is populated for room scopes only:
@@ -69,18 +71,18 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use yoink_core::{AppCommand, DeviceInfo, DocSet};
+use yoink_core::{AppCommand, DeviceInfo, DocSet, ShareMode};
 use yoink_discovery::PeerInfo;
 use yoink_sync::SyncManager;
 
-/// UI-visible slice of the app's runtime configuration. A snapshot the app
-/// loop keeps in sync; the server only reads it to fill `settings` in the
-/// state JSON.
+/// UI-visible slice of the app's runtime configuration. The app loop keeps
+/// this in sync; trust-mode state comes directly from [`SyncManager`] when
+/// building state JSON so there is one source of truth.
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// Whether incoming personal-clipboard entries are written to the OS
-    /// clipboard automatically (the user's `SetAutoApply` choice).
-    pub auto_apply: bool,
+    /// The active share mode, chosen with `--mode` at startup. Read-only in
+    /// the UI (serialized as `"manual"` / `"auto-share"` / `"mirror"`).
+    pub mode: ShareMode,
     /// Whether an OS clipboard backend was found at startup; when `false` the
     /// UI hides clipboard-dependent affordances rather than failing silently.
     pub clipboard_available: bool,
@@ -92,7 +94,8 @@ pub struct PeerView {
     /// Last-known discovery announcement for the peer (identity, name, rooms).
     pub info: PeerInfo,
     /// Whether the peer is currently advertising on the network. Kept distinct
-    /// from removal so an allowed-but-offline peer can still be revoked.
+    /// from removal so an explicitly paired/blocked offline peer can still be
+    /// unpaired/unblocked.
     pub online: bool,
 }
 
@@ -105,9 +108,9 @@ pub struct ServerCtx {
     /// All scoped documents; read to build the `entries` history per scope.
     pub docs: Arc<DocSet>,
     /// Peer sync engine: serves `/sync` inbound connections and reports
-    /// per-scope live connectivity and the personal-clipboard allowlist.
+    /// per-scope live connectivity and the personal-clipboard trust state.
     pub sync: Arc<SyncManager>,
-    /// Discovered/allowed peer registry keyed by device id, maintained by the
+    /// Discovered/listed peer registry keyed by device id, maintained by the
     /// app loop; the union the devices view renders.
     pub peers: Arc<parking_lot::RwLock<HashMap<String, PeerView>>>,
     /// UI-visible settings snapshot, kept current by the app loop.

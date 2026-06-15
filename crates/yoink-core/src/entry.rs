@@ -12,7 +12,7 @@ pub struct ClipEntry {
     /// Stable per-entry UUID, used to address an entry across peers (e.g. for
     /// [`crate::AppCommand::CopyEntry`]).
     pub id: String,
-    /// Id of the device that created the entry; matched against the allowlist.
+    /// Id of the device that created the entry.
     pub device_id: String,
     /// Display name of the creating device at creation time (may go stale if
     /// the device later renames itself).

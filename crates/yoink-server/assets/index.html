@@ -28,8 +28,8 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
-  /* Custom `display` values on .toggle-label etc. would otherwise beat the
-     UA's [hidden] rule and un-hide them. */
+  /* Custom `display` values on chips and inline-flex elements would otherwise
+     beat the UA's [hidden] rule and un-hide them. */
   [hidden] { display: none !important; }
   body {
     background: radial-gradient(1100px 500px at 50% -180px, #141b2e 0%, var(--bg) 62%) fixed var(--bg);
@@ -105,40 +105,11 @@
     border: 1px solid rgba(251, 191, 36, 0.35);
     background: rgba(251, 191, 36, 0.08);
   }
-
-  .toggle-label {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    color: var(--muted);
-    cursor: pointer;
-    user-select: none;
-    flex: none;
+  .chip.neutral {
+    color: var(--accent);
+    border: 1px solid var(--accent-edge);
+    background: var(--accent-soft);
   }
-  .switch {
-    appearance: none;
-    -webkit-appearance: none;
-    width: 36px; height: 21px;
-    border-radius: 11px;
-    background: #2a3245;
-    border: 1px solid #323c54;
-    position: relative;
-    cursor: pointer;
-    flex: none;
-    margin: 0;
-  }
-  .switch::after {
-    content: "";
-    position: absolute;
-    top: 2px; left: 2px;
-    width: 15px; height: 15px;
-    border-radius: 50%;
-    background: #cdd3e1;
-  }
-  .switch:checked { background: var(--accent); border-color: var(--accent); }
-  .switch:checked::after { left: 17px; background: var(--accent-ink); }
-  .switch:disabled { opacity: 0.45; cursor: not-allowed; }
 
   nav {
     display: flex;
@@ -382,120 +353,9 @@
     white-space: nowrap;
     color: var(--faint);
   }
-  .entry-meta .entry-device, .row-meta .entry-device { color: var(--muted); font-weight: 600; }
-
-  .hero-card {
-    background: linear-gradient(180deg, rgba(124, 140, 255, 0.09), rgba(124, 140, 255, 0.02) 65%), var(--panel);
-    border: 1px solid var(--accent-edge);
-    border-radius: var(--radius);
-    box-shadow: 0 6px 28px rgba(124, 140, 255, 0.08);
-    padding: 16px 18px 13px;
-  }
-  .hero-text {
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 6;
-    overflow: hidden;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    cursor: pointer;
-    font-size: 17px;
-    line-height: 1.6;
-    margin: 0 0 14px;
-  }
-  .hero-text.expanded { display: block; -webkit-line-clamp: none; }
-
-  .earlier { margin-top: 14px; }
-  .earlier-head {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    font: inherit;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: var(--faint);
-    background: transparent;
-    border: none;
-    border-radius: 6px;
-    padding: 4px 2px;
-    cursor: pointer;
-  }
-  .earlier-head:hover { color: var(--muted); }
-  .earlier-chevron { width: 12px; height: 12px; flex: none; }
-  .earlier-head[aria-expanded="true"] .earlier-chevron { transform: rotate(90deg); }
-  .earlier-list { margin-top: 8px; }
-
-  .entry-row { display: flex; align-items: center; gap: 10px; padding: 8px 14px; }
-  .entry-row + .entry-row { border-top: 1px solid var(--border-soft); }
-  .entry-row.open { flex-wrap: wrap; padding: 11px 14px; }
-  .entry-row.open .row-meta { flex: 1; }
-  .row-text {
-    flex: 1;
-    min-width: 0;
-    margin: 0;
-    font-size: 13px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    cursor: pointer;
-  }
-  .row-text.expanded {
-    flex-basis: 100%;
-    white-space: pre-wrap;
-    overflow: visible;
-    text-overflow: clip;
-    overflow-wrap: anywhere;
-  }
-  .row-meta { font-size: 12px; color: var(--faint); flex: none; white-space: nowrap; }
-  .row-actions { display: inline-flex; gap: 6px; flex: none; }
-  /* Pointer users get quieter rows: collapsed rows show only "device · time",
-     and the copy buttons fade in over that corner on hover/focus (reserving
-     inline space would leave a dead gap). The hover guard keeps the buttons
-     always visible on touch screens, and .pinned keeps the "Copied ✓" flash
-     visible after the pointer moves on. Expanded rows have room, so their
-     buttons stay put. */
-  @media (hover: hover) and (pointer: fine) {
-    .entry-row { position: relative; }
-    .entry-row:not(.open) .row-actions {
-      position: absolute;
-      top: 50%;
-      right: 9px;
-      transform: translateY(-50%);
-      padding-left: 22px;
-      background: linear-gradient(90deg, rgba(20, 25, 39, 0), var(--panel) 16px);
-      opacity: 0;
-      pointer-events: none;
-    }
-    .entry-row:not(.open):hover .row-actions,
-    .entry-row:not(.open):focus-within .row-actions,
-    .entry-row:not(.open) .row-actions.pinned {
-      opacity: 1;
-      pointer-events: auto;
-    }
-  }
-  .show-all {
-    display: block;
-    width: 100%;
-    font: inherit;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--muted);
-    background: transparent;
-    border: none;
-    border-top: 1px solid var(--border-soft);
-    padding: 9px 14px;
-    cursor: pointer;
-  }
-  .show-all:hover { color: var(--accent); background: var(--bg-raise); }
-  @media (max-width: 520px) {
-    .entry-row:not(.open) .row-meta { display: none; }
-  }
+  .entry-meta .entry-device { color: var(--muted); font-weight: 600; }
 
   @media (prefers-reduced-motion: no-preference) {
-    .switch { transition: background 0.15s, border-color 0.15s; }
-    .switch::after { transition: left 0.15s, background 0.15s; }
     .pill, .btn, .joined-chip { transition: color 0.13s, background 0.13s, border-color 0.13s; }
     .share-card { transition: border-color 0.15s; }
     @keyframes dot-pulse {
@@ -508,18 +368,6 @@
       to { opacity: 1; transform: none; }
     }
     .entry-new { animation: entry-in 0.35s ease; }
-    .earlier-chevron { transition: transform 0.15s; }
-    .row-actions { transition: opacity 0.12s; }
-    /* The hero element is stable across morphs, so a fresh entry lands as a
-       content swap; this ring-and-settle makes the handoff legible. */
-    @keyframes hero-in {
-      from {
-        opacity: 0.3;
-        transform: translateY(-4px);
-        box-shadow: 0 0 0 6px rgba(124, 140, 255, 0.2);
-      }
-    }
-    .hero-card.entry-new { animation: hero-in 0.45s ease; }
     @keyframes bar-blink { 50% { opacity: 0.55; } }
     #reconnect { animation: bar-blink 1.6s ease-in-out infinite; }
   }
@@ -536,10 +384,7 @@
     <span class="device-chip" id="device-name" title="This device's name on the network"></span>
     <span class="spacer"></span>
     <span id="clip-warn" class="chip warn" hidden title="yoink can't reach an OS clipboard here; sharing and browser copy still work">clipboard unavailable</span>
-    <label class="toggle-label" id="auto-apply-label" title="Automatically put entries received from your other devices on this device's clipboard">
-      Auto-apply
-      <input type="checkbox" class="switch" id="auto-apply">
-    </label>
+    <span class="chip" id="mode-chip" hidden></span>
   </header>
 
   <nav id="nav" aria-label="Spaces"></nav>
@@ -552,7 +397,7 @@
       <textarea id="share-text" rows="3"></textarea>
       <div class="share-actions">
         <span class="hint"><kbd>Ctrl/⌘ Enter</kbd> to send &middot; <kbd>/</kbd> to focus</span>
-        <button class="btn primary" id="share-btn">Yoink it</button>
+        <button class="btn primary" id="share-btn">Share</button>
       </div>
     </div>
   </section>
@@ -583,10 +428,6 @@ let newRoomDraft = "";
 const expanded = new Set();        // entry ids shown un-clamped
 const flashes = new Map();         // "{entryId}:{kind}" -> flash label
 const seenEntries = new Set();     // entry ids already rendered once
-let earlierOpen = false;           // "Earlier" disclosure on the devices view
-let earlierShowAll = false;        // earlier list uncapped after "show all"
-let prevHeroId = null;             // last rendered hero entry, to animate its demotion
-const EARLIER_PREVIEW = 15;        // earlier rows shown before "show all"
 
 const navEl = document.getElementById("nav");
 const viewEl = document.getElementById("view");
@@ -658,13 +499,25 @@ function newRoomPreview() {
 
 function peerRow(peer) {
   const status = peer.connected ? "connected" : peer.online ? "online" : "offline";
+  const pairing = state.settings.require_pairing;
+  let statusText, control;
+  if (pairing) {
+    statusText = status;
+    control = peer.trusted
+      ? `<button class="btn quiet small" data-action="set-device-trusted" data-id="${esc(peer.id)}" data-trusted="false" title="Stop sharing with this device">Unpair</button>`
+      : `<button class="btn primary small" data-action="set-device-trusted" data-id="${esc(peer.id)}" data-trusted="true" title="Pair with this device to share clipboards">Pair</button>`;
+  } else if (peer.trusted) {
+    statusText = status;
+    control = `<button class="btn quiet small" data-action="set-device-trusted" data-id="${esc(peer.id)}" data-trusted="false" title="Block this device from sharing with you">Block</button>`;
+  } else {
+    statusText = "blocked";
+    control = `<button class="btn small" data-action="set-device-trusted" data-id="${esc(peer.id)}" data-trusted="true" title="Unblock this device so it can share with you">Unblock</button>`;
+  }
   return `<div class="row" id="peer-${esc(peer.id)}">
     <span class="dot ${status}"></span>
     <div class="grow"><div class="peer-name" title="${esc(peer.id)}">${esc(peer.name)}</div></div>
-    <span class="peer-status">${status}</span>
-    <label class="toggle-label" title="Share your clipboard with this device (it has to allow you back)">Share
-      <input type="checkbox" class="switch" data-action="set-allowed" data-id="${esc(peer.id)}"${peer.allowed ? " checked" : ""}>
-    </label>
+    <span class="peer-status">${esc(statusText)}</span>
+    ${control}
   </div>`;
 }
 
@@ -743,83 +596,41 @@ function entryArticle(entry) {
   </article>`;
 }
 
-/* The hero keeps a fixed element id on purpose: when a fresh entry arrives,
-   idiomorph swaps its content in place instead of replacing the card, so the
-   page doesn't jump and the hero-in animation reads as a handoff. */
-function heroHtml(entry) {
-  const isNew = !firstRender && !seenEntries.has(entry.id);
-  const isExpanded = expanded.has(entry.id);
-  return `<article class="hero-card${isNew ? " entry-new" : ""}" id="hero-card">
-    <p class="hero-text${isExpanded ? " expanded" : ""}" data-action="expand" data-id="${esc(entry.id)}" title="Click to ${isExpanded ? "collapse" : "expand"}">${esc(entry.text)}</p>
-    ${entryFoot(entry, "")}
-  </article>`;
-}
-
-function entryRow(entry, demoted) {
-  const isExpanded = expanded.has(entry.id);
-  // The flash must stay visible even though row buttons are hover-only.
-  const pinned = flashes.has(entry.id + ":os") || flashes.has(entry.id + ":browser");
-  // Collapsed rows are one-liners; newlines and runs of spaces would read as
-  // odd gaps, so condense them until the row is expanded.
-  const text = isExpanded ? entry.text : entry.text.replace(/\s+/g, " ").trim();
-  return `<div class="entry-row${isExpanded ? " open" : ""}${demoted ? " entry-new" : ""}" id="entry-${esc(entry.id)}">
-    <p class="row-text${isExpanded ? " expanded" : ""}" data-action="expand" data-id="${esc(entry.id)}" title="Click to ${isExpanded ? "collapse" : "expand"}">${esc(text)}</p>
-    <span class="row-meta"><span class="entry-device">${esc(entry.device_name)}</span> &middot; ${relTime(entry.created_at_ms)}</span>
-    <span class="row-actions${pinned ? " pinned" : ""}">${copyButtons(entry, " small")}</span>
-  </div>`;
-}
-
-function earlierHtml(rest, demotedId) {
-  const shown = earlierShowAll ? rest : rest.slice(0, EARLIER_PREVIEW);
-  const chevron = `<svg class="earlier-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>`;
-  // The list is rendered even while collapsed (just [hidden]) so that
-  // aria-controls always resolves and toggling is a single attribute flip
-  // for idiomorph instead of a rebuild.
-  let html = `<div class="earlier">
-    <button class="earlier-head" id="earlier-toggle" data-action="toggle-earlier" aria-expanded="${earlierOpen}" aria-controls="earlier-list" title="Everything that came before the current entry">${chevron}Earlier &middot; ${rest.length} item${rest.length === 1 ? "" : "s"}</button>
-    <div class="card earlier-list" id="earlier-list"${earlierOpen ? "" : " hidden"}>`
-    + shown.map((e) => entryRow(e, e.id === demotedId)).join("");
-  if (rest.length > shown.length) {
-    html += `<button class="show-all" data-action="show-all-earlier">Show all ${rest.length} items</button>`;
-  }
-  return html + `</div></div>`;
-}
-
 function devicesEntriesHtml() {
-  let html = `<section id="sec-clip"><h2>Current clipboard</h2>`;
   if (state.entries.length === 0) {
-    return html + `<div class="card"><div class="empty">Nothing yoinked yet. Share something above, or copy text on a paired device.</div></div></section>`;
+    return `<section id="sec-clip"><h2>Shared</h2><div class="card"><div class="empty">Nothing shared yet. Paste something above and hit Share.</div></div></section>`;
   }
-  const current = state.entries[0];
-  html += heroHtml(current);
-  const rest = state.entries.slice(1);
-  if (rest.length > 0) {
-    const demotedId = prevHeroId && prevHeroId !== current.id ? prevHeroId : null;
-    html += earlierHtml(rest, demotedId);
-  }
-  return html + `</section>`;
+  return `<section id="sec-clip"><h2>Shared</h2><div class="card">${state.entries.map(entryArticle).join("")}</div></section>`;
 }
 
 function entriesHtml() {
   if (SCOPE.kind === "devices") return devicesEntriesHtml();
   if (state.entries.length === 0) {
-    return `<section id="sec-feed"><div class="card"><div class="empty">Nothing in #${esc(SCOPE.name)} yet. Drop something in the box above.</div></div></section>`;
+    return `<section id="sec-feed"><div class="card"><div class="empty">Nothing in #${esc(SCOPE.name)} yet. Paste something above and hit Share.</div></div></section>`;
   }
   return `<section id="sec-feed"><div class="card">${state.entries.map(entryArticle).join("")}</div></section>`;
 }
+
+const MODE_TITLES = {
+  "manual": "Manual sharing: paste text here and click Share.",
+  "auto-share": "Whatever you copy is shared automatically; received items wait here — click Copy to use one.",
+  "mirror": "Two-way clipboard mirror: copies are shared and received items go to your clipboard automatically.",
+};
 
 function render() {
   if (!state) return;
   document.getElementById("device-name").textContent = state.device.name;
   document.getElementById("clip-warn").hidden = state.settings.clipboard_available;
-  const auto = document.getElementById("auto-apply");
-  auto.checked = state.settings.auto_apply;
-  auto.disabled = !state.settings.clipboard_available;
+  const modeChip = document.getElementById("mode-chip");
+  const mode = state.settings.mode;
+  modeChip.hidden = false;
+  modeChip.className = "chip neutral";
+  modeChip.textContent = mode;
+  modeChip.title = MODE_TITLES[mode] || "";
   morph(navEl, navHtml());
   morph(viewEl, SCOPE.kind === "room" ? roomViewHtml() : devicesViewHtml());
   morph(entriesEl, entriesHtml());
   for (const entry of state.entries) seenEntries.add(entry.id);
-  if (state.entries.length > 0) prevHeroId = state.entries[0].id;
   firstRender = false;
 }
 
@@ -897,23 +708,9 @@ document.addEventListener("click", (ev) => {
       if (input) input.focus();
       break;
     }
-    case "toggle-earlier":
-      earlierOpen = !earlierOpen;
-      render();
+    case "set-device-trusted":
+      post({ cmd: "set_device_trusted", device_id: el.dataset.id, trusted: el.dataset.trusted === "true" });
       break;
-    case "show-all-earlier":
-      earlierShowAll = true;
-      render();
-      break;
-  }
-});
-
-document.addEventListener("change", (ev) => {
-  const el = ev.target;
-  if (el.dataset && el.dataset.action === "set-allowed") {
-    post({ cmd: "set_allowed", device_id: el.dataset.id, allowed: el.checked });
-  } else if (el.id === "auto-apply") {
-    post({ cmd: "set_auto_apply", enabled: el.checked });
   }
 });
 
@@ -992,15 +789,13 @@ setInterval(render, 30000);
     document.title = "yoink — #" + SCOPE.name;
     document.getElementById("share-heading").textContent = "Share to #" + SCOPE.name;
     shareText.placeholder = "Type or paste something to drop into #" + SCOPE.name + "…";
-    // The OS clipboard never feeds rooms, so auto-apply has no meaning here.
-    document.getElementById("auto-apply-label").hidden = true;
     // Visiting is joining: idempotent, and it creates the room when needed.
     try { await post({ cmd: "join_room", name: SCOPE.name }); } catch {}
   } else {
     shareText.placeholder = "Type or paste something to send to your devices…";
-    /* The devices view leads with the clipboard itself: compose box, then the
-       current entry it feeds, with device management below. One-time move
-       before the first render, so idiomorph never sees sections relocate. */
+    /* The devices view leads with the compose box, then the shared list it
+       feeds, with device management below. One-time move before the first
+       render, so idiomorph never sees sections relocate. */
     const main = document.querySelector("main");
     main.insertBefore(document.getElementById("sec-share"), viewEl);
     main.insertBefore(entriesEl, viewEl);

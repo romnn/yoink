@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use yoink_core::{ClipDoc, DeviceInfo, DocSet, PROTOCOL_VERSION, Scope};
 use yoink_discovery::PeerInfo;
-use yoink_sync::{SyncEvent, SyncManager};
+use yoink_sync::{SyncEvent, SyncManager, TrustSettings};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -40,9 +40,30 @@ async fn stack(id: &str, allowed: &[&str]) -> Result<Stack, std::io::Error> {
     stack_with_rooms(id, allowed, &[]).await
 }
 
+/// Allowlist-based stack: runs in the strict pairing model so `allowed` gates
+/// connections exactly as the mutual-allow tests expect.
 async fn stack_with_rooms(
     id: &str,
     allowed: &[&str],
+    rooms: &[&str],
+) -> Result<Stack, std::io::Error> {
+    let trust = TrustSettings {
+        require_pairing: true,
+        allowed: allowed.iter().map(ToString::to_string).collect(),
+        blocked: HashSet::new(),
+    };
+    stack_with_trust(id, trust, rooms).await
+}
+
+/// A stack in the default trust model: every discovered device is trusted
+/// unless explicitly blocked, so peers connect without any pairing.
+async fn trusting_stack(id: &str) -> Result<Stack, std::io::Error> {
+    stack_with_trust(id, TrustSettings::default(), &[]).await
+}
+
+async fn stack_with_trust(
+    id: &str,
+    trust: TrustSettings,
     rooms: &[&str],
 ) -> Result<Stack, std::io::Error> {
     let docs = Arc::new(DocSet::new());
@@ -50,9 +71,8 @@ async fn stack_with_rooms(
         id: id.to_string(),
         name: format!("device-{id}"),
     };
-    let allowed: HashSet<String> = allowed.iter().map(ToString::to_string).collect();
     let joined: HashSet<String> = rooms.iter().map(ToString::to_string).collect();
-    let (manager, events) = SyncManager::new(docs.clone(), device.clone(), allowed, &joined);
+    let (manager, events) = SyncManager::new(docs.clone(), device.clone(), trust, &joined);
 
     let app = axum::Router::new()
         .route("/sync", axum::routing::any(sync_route))
@@ -308,7 +328,7 @@ async fn one_sided_allow_is_refused() {
     while let Ok(event) = b.events.try_recv() {
         assert!(
             !matches!(event, SyncEvent::PeerConnected { .. }),
-            "B must never report an un-allowed peer as connected: {event:?}"
+            "B must never report an unpaired peer as connected: {event:?}"
         );
     }
     // B sends its HELLO before validating ours and only then closes, so A's
@@ -320,7 +340,76 @@ async fn one_sided_allow_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn disallow_hangs_up_and_both_sides_observe_disconnect() {
+async fn default_trust_model_connects_without_pairing() {
+    // Neither side explicitly lists the other; under the default trust model
+    // they must still connect and sync the personal clipboard automatically.
+    let mut a = trusting_stack("aaa").await.expect("test stack");
+    let b = trusting_stack("bbb").await.expect("test stack");
+    connect_mutually(&a, &b);
+
+    expect_event(
+        &mut a.events,
+        connected_event("bbb", "device-bbb", Scope::Devices),
+    )
+    .await;
+
+    b.doc.add_entry(&b.device, "no pairing needed".into());
+    wait_for("entry reaches a without any pairing", || {
+        a.doc
+            .entries()
+            .iter()
+            .any(|e| e.text == "no pairing needed")
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_trust_model_block_refuses_then_unblock_reconnects() {
+    let mut a = trusting_stack("aaa").await.expect("test stack");
+    let trust = TrustSettings {
+        blocked: ["aaa".to_string()].into(),
+        ..TrustSettings::default()
+    };
+    let mut b = stack_with_trust("bbb", trust, &[])
+        .await
+        .expect("test stack");
+    connect_mutually(&a, &b);
+
+    a.doc.add_entry(&a.device, "blocked secret".into());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    assert!(!b.manager.is_trusted("aaa"));
+    assert_eq!(b.manager.blocked(), HashSet::from(["aaa".to_string()]));
+    assert!(b.manager.connected(&Scope::Devices).is_empty());
+    assert!(
+        b.doc.entries().is_empty(),
+        "blocked peer must not sync document data"
+    );
+    while let Ok(event) = b.events.try_recv() {
+        assert!(
+            !matches!(event, SyncEvent::PeerConnected { .. }),
+            "B must never report a blocked peer as connected: {event:?}"
+        );
+    }
+
+    b.manager.set_trusted("aaa", true);
+    assert!(b.manager.is_trusted("aaa"));
+    assert!(b.manager.blocked().is_empty());
+    expect_event(
+        &mut a.events,
+        connected_event("bbb", "device-bbb", Scope::Devices),
+    )
+    .await;
+
+    a.doc.add_entry(&a.device, "after unblock".into());
+    wait_for("entry reaches b after unblock", || {
+        b.doc.entries().iter().any(|e| e.text == "after unblock")
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unpair_hangs_up_and_both_sides_observe_disconnect() {
     let mut a = stack("aaa", &["bbb"]).await.expect("test stack");
     let mut b = stack("bbb", &["aaa"]).await.expect("test stack");
     connect_mutually(&a, &b);
@@ -336,8 +425,8 @@ async fn disallow_hangs_up_and_both_sides_observe_disconnect() {
     )
     .await;
 
-    // B hangs up; A only finds out through the socket closing.
-    b.manager.set_allowed("aaa", false);
+    // B unpairs A; A only finds out through the socket closing.
+    b.manager.set_trusted("aaa", false);
 
     expect_event(&mut b.events, disconnected_event("aaa", Scope::Devices)).await;
     expect_event(&mut a.events, disconnected_event("bbb", Scope::Devices)).await;
@@ -346,7 +435,7 @@ async fn disallow_hangs_up_and_both_sides_observe_disconnect() {
             && b.manager.connected(&Scope::Devices).is_empty()
     })
     .await;
-    assert!(!b.manager.is_allowed("aaa"));
+    assert!(!b.manager.is_trusted("aaa"));
     assert!(b.manager.allowed().is_empty());
 }
 
@@ -362,12 +451,12 @@ async fn dialer_reconnects_after_peer_returns() {
     )
     .await;
 
-    b.manager.set_allowed("aaa", false);
+    b.manager.set_trusted("aaa", false);
     expect_event(&mut a.events, disconnected_event("bbb", Scope::Devices)).await;
 
-    // Once B allows A again, A's backoff dialer must re-establish the
+    // Once B pairs A again, A's backoff dialer must re-establish the
     // connection without any new discovery event.
-    b.manager.set_allowed("aaa", true);
+    b.manager.set_trusted("aaa", true);
     expect_event(
         &mut a.events,
         connected_event("bbb", "device-bbb", Scope::Devices),

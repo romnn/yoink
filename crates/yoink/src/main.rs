@@ -3,50 +3,57 @@
 //! The binary wires everything together and runs the app event loop, which
 //! is the single owner of all mutation:
 //!
-//! 1. Clipboard `Copied(text)` → skip if `text` matches one of the last few
-//!    history entries (dedupe / echo guard; a window of one is not enough
-//!    when two instances share one OS clipboard) → `add_entry` on the
-//!    *devices* doc. The OS clipboard is hard-wired to the devices scope;
-//!    it never feeds a room.
+//! 1. Clipboard `Copied(text)` → only in the `auto-share`/`mirror` modes
+//!    (the default `manual` mode never shares what you copy) → skip if `text`
+//!    matches one of the last few history entries (dedupe / echo guard; a
+//!    window of one is not enough when two instances share one OS clipboard)
+//!    → `add_entry` on the *devices* doc. The OS clipboard is hard-wired to
+//!    the devices scope; it never feeds a room.
 //! 2. Per-scope doc updates (one forwarder task per open scope feeds a
-//!    merged channel) → mark that scope's snapshot dirty; if the scope is
-//!    `devices`, `origin` is remote, auto-apply is on and the latest entry
-//!    is from another device, wasn't applied before (track last applied
-//!    entry id) and is fresh (created within ~30s of local now, so a
+//!    merged channel) → notify the UI; and in `mirror` mode, if the scope is
+//!    `devices`, `origin` is remote, the clipboard is reachable and the
+//!    latest entry is from another device, wasn't applied before (track last
+//!    applied entry id) and is fresh (created within ~30s of local now, so a
 //!    `SYNC_STEP_2` backlog replay never clobbers the clipboard with stale
-//!    entries) → `clipboard.set_text`; room updates never touch the OS
-//!    clipboard; notify the UI.
+//!    entries) → `clipboard.set_text`. Rooms never touch the OS clipboard.
 //! 3. Discovery events → update the peer registry (lost peers are kept
-//!    offline when allowed, removed when not), forward to
-//!    `sync.peer_discovered` / `peer_lost`; notify the UI.
+//!    offline when still connected or explicitly listed, removed otherwise),
+//!    forward to `sync.peer_discovered` / `peer_lost`; notify the UI.
 //! 4. Sync events (connect/disconnect, per scope) → notify the UI; a
 //!    devices-scope connect also seeds the peer registry from the HELLO.
 //! 5. [`AppCommand`]s from the server:
-//!    - `SetAllowed` → `sync.set_allowed` + persist config + notify
-//!    - `SetAutoApply` → settings + persist config + notify
+//!    - `SetDeviceTrusted` → block/unblock (or pair/unpair under
+//!      `--require-pairing`) via `sync.set_trusted` + persist config + notify
 //!    - `AddEntry` → dedupe against the scope's latest entry only, add to
 //!      that scope's doc; devices adds also set the local clipboard (even
 //!      when the entry was a duplicate) — room adds never do
 //!    - `CopyEntry` → look up entry by id in the scope's doc →
 //!      `clipboard.set_text` (deliberate, so allowed from rooms too)
-//!    - `JoinRoom` → restore-or-create `rooms/{name}.bin`, start syncing
-//!      and advertising the room, persist it in the config + notify
-//!    - `LeaveRoom` → stop syncing/advertising, flush a final snapshot
-//!      (the file is kept: rejoining restores history), drop the doc + notify
-//! 6. Ctrl-C → save every dirty snapshot, `discovery.shutdown()`, exit.
+//!    - `JoinRoom` → create-or-find the room's doc, start syncing and
+//!      advertising the room, persist it in the config + notify
+//!    - `LeaveRoom` → stop syncing/advertising, drop the doc + notify
+//! 6. Ctrl-C → persist the config, `discovery.shutdown()`, exit.
 //!
-//! Snapshot and config writes run on the blocking pool (reaped on the next
-//! flush tick) so a slow disk cannot stall event consumption; each scope's
-//! snapshot file has its own single writer.
+//! Clipboard history is never written to disk: every run starts empty and a
+//! restart clears it. Only the config is persisted, on the blocking pool
+//! (reaped on the next flush tick) so a slow disk cannot stall event
+//! consumption.
 //!
 //! The server listens on `0.0.0.0` plus a best-effort `IPV6_V6ONLY` `[::]`
 //! socket on the same port, because mDNS advertises IPv6 addresses too.
 //!
+//! Trust model: by default every device on the LAN is trusted and syncs the
+//! personal clipboard automatically; blocking one (persisted) stops it.
+//! `--require-pairing` flips this to a strict allowlist where devices must
+//! pair first. Rooms are always open-join regardless. `--mode` selects how
+//! the OS clipboard is involved (manual / auto-share / mirror), and
+//! `--untrusted` is a one-flag hardened preset for networks you don't control
+//! (forces `--require-pairing` + manual mode).
+//!
 //! Config (`config.toml` in the config dir): `device_id` (created on first
-//! run), optional `name` override, `auto_apply` (default true), `allowed`
-//! (persisted allowlist), `rooms` (joined rooms, rejoined on startup). The
-//! devices doc snapshot lives next to it as `state.bin`; each joined room
-//! snapshots to `rooms/{name}.bin`.
+//! run), optional `name` override, `allowed` (paired devices, used under
+//! `--require-pairing`), `blocked` (blocked devices), `rooms` (joined rooms,
+//! rejoined — empty — on startup since history is not persisted).
 //!
 //! [`AppCommand`]: yoink_core::AppCommand
 
@@ -62,10 +69,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use yoink_clipboard::ClipboardHandle;
-use yoink_core::{DeviceInfo, DocSet};
+use yoink_core::{DeviceInfo, DocSet, ShareMode};
 use yoink_discovery::Discovery;
 use yoink_server::{ServerCtx, Settings};
-use yoink_sync::SyncManager;
+use yoink_sync::{SyncManager, TrustSettings};
 
 use crate::app::{App, AppChannels};
 use crate::config::Config;
@@ -91,6 +98,55 @@ struct Args {
     /// Handy for headless machines or running several instances at once.
     #[arg(long = "no-open")]
     no_open: bool,
+
+    /// How clipboard text moves between devices: `manual` (default — share
+    /// only what you paste in and click Share), `auto-share` (auto-share
+    /// whatever you copy; received items wait to be copied), or `mirror`
+    /// (full two-way clipboard mirror).
+    #[arg(long, value_parser = parse_mode, default_value_t = ShareMode::Manual)]
+    mode: ShareMode,
+
+    /// Require devices to explicitly pair before syncing the personal
+    /// clipboard. Off by default: every device on your network is trusted
+    /// until you block it.
+    #[arg(long)]
+    require_pairing: bool,
+
+    /// Harden yoink for a network you don't control (a large shared or public
+    /// LAN). A one-flag conservative preset that forces strict pairing
+    /// (as `--require-pairing`) and manual share mode (`--mode manual`),
+    /// overriding those flags.
+    #[arg(long)]
+    untrusted: bool,
+}
+
+/// clap value parser for `--mode`: maps the kebab-case spelling to a
+/// [`ShareMode`] with a friendly error listing the choices.
+fn parse_mode(s: &str) -> Result<ShareMode, String> {
+    s.parse()
+        .map_err(|_| format!("unknown mode '{s}' (expected: manual, auto-share, mirror)"))
+}
+
+/// Resolve the effective trust model and share mode from the CLI flags.
+///
+/// `--untrusted` is the hardened preset for networks you don't control: it
+/// forces strict pairing and manual share mode regardless of the matching
+/// individual flags (warning if an explicit `--mode` is overridden). Future
+/// conservative defaults belong here too, so the one flag locks them all.
+fn resolve_hardening(args: &Args) -> (bool, ShareMode) {
+    let require_pairing = args.require_pairing || args.untrusted;
+    let mode = if args.untrusted {
+        if args.mode != ShareMode::Manual {
+            tracing::warn!(
+                requested = %args.mode,
+                "--untrusted forces manual share mode; ignoring --mode"
+            );
+        }
+        ShareMode::Manual
+    } else {
+        args.mode
+    };
+    (require_pairing, mode)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -112,12 +168,16 @@ fn init_tracing() {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
+    let (require_pairing, mode) = resolve_hardening(&args);
+
     let config_dir = resolve_config_dir(args.config_dir)?;
     let mut config = Config::load_or_init(&config_dir)?;
     // We only ever persist sanitized room names, but the config can be
     // hand-edited; canonicalize once so unsanitized names (which could never
     // round-trip the sync wire encoding) don't get advertised or joined.
-    config.rooms = config::sanitize_rooms(&config.rooms);
+    let sanitized_rooms = config::sanitize_rooms(&config.rooms);
+    let config_dirty = sanitized_rooms != config.rooms;
+    config.rooms = sanitized_rooms;
 
     let name = args
         .name
@@ -129,13 +189,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
 
     let docs = Arc::new(DocSet::new());
-    // Restore every persisted doc and wire its update forwarder *before*
-    // sync or the server exist, so no update can slip past the loop
-    // (broadcast receivers only see messages sent after subscribing) and
-    // sync joins the restored room docs instead of creating empty ones.
+    // Create every scope's doc and wire its update forwarder *before* sync or
+    // the server exist, so no update can slip past the loop (broadcast
+    // receivers only see messages sent after subscribing) and sync joins
+    // these docs instead of creating empty ones. History is not persisted, so
+    // there is nothing to restore — every scope starts empty.
     let (doc_events_tx, doc_rx) = mpsc::channel(app::DOC_EVENT_QUEUE);
-    let (forwarders, snapshots) =
-        app::restore_scopes(&docs, &config_dir, &config.rooms, &doc_events_tx);
+    let forwarders = app::wire_scopes(&docs, &config.rooms, &doc_events_tx);
 
     let listener = bind_listener(args.port).await?;
     let port = listener
@@ -154,18 +214,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
 
     let (clipboard, clipboard_rx) = ClipboardHandle::spawn(Duration::from_millis(400));
     let seeded_rooms: std::collections::HashSet<String> = config.rooms.iter().cloned().collect();
-    let (sync, sync_rx) = SyncManager::new(
-        docs.clone(),
-        device.clone(),
-        config.allowed.iter().cloned().collect(),
-        &seeded_rooms,
-    );
+    let trust = TrustSettings {
+        require_pairing,
+        allowed: config.allowed.iter().cloned().collect(),
+        blocked: config.blocked.iter().cloned().collect(),
+    };
+    let (sync, sync_rx) = SyncManager::new(docs.clone(), device.clone(), trust, &seeded_rooms);
     let (discovery, discovery_rx) = Discovery::start(&device.id, &device.name, port, &config.rooms)
         .context("failed to start mDNS peer discovery")?;
 
     let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let settings = Arc::new(parking_lot::RwLock::new(Settings {
-        auto_apply: config.auto_apply,
+        mode,
         clipboard_available: clipboard.available(),
     }));
     let joined_rooms = Arc::new(parking_lot::RwLock::new(
@@ -198,6 +258,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         docs,
         device,
         clipboard,
+        auto_capture: mode.captures_clipboard(),
+        auto_apply: mode.auto_applies(),
         sync,
         discovery,
         peers,
@@ -207,8 +269,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         config,
         config_dir,
         last_applied_entry_id: None,
-        snapshots,
-        config_dirty: false,
+        config_dirty,
         config_write: app::BackgroundWrite::idle(),
         doc_events_tx,
         forwarders,

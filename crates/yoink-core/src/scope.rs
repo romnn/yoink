@@ -12,13 +12,14 @@ pub const MAX_ROOM_NAME_LEN: usize = 48;
 
 /// Which shared space an entry, connection or command belongs to.
 ///
-/// `Devices` is the personal clipboard: allowlist-gated, fed by the OS
-/// clipboard, auto-applied. A `Room` is an open named space anyone on the
-/// LAN can join; nothing enters a room except by deliberate user action.
+/// `Devices` is the personal clipboard: LAN-trusted by default (or
+/// allowlist-gated under strict pairing) and connected to the OS clipboard
+/// according to the selected share mode. A `Room` is an open named space
+/// anyone on the LAN can join; nothing enters a room except by deliberate
+/// user action.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {
-    /// The personal clipboard, shared only between this user's allowlisted
-    /// devices.
+    /// The personal clipboard, shared with trusted devices.
     Devices,
     /// A named LAN-wide room anyone can join; carries the room name.
     Room(String),
@@ -117,9 +118,9 @@ pub fn sanitize_room_name(input: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// All documents this instance holds, one per scope. The `Devices` doc
-/// always exists; room docs are created when a room is joined and removed
-/// when it is left (their snapshots may outlive them on disk).
+/// All in-memory documents this instance holds, one per scope. The `Devices`
+/// doc always exists; room docs are created when a room is joined and removed
+/// when it is left.
 pub struct DocSet {
     /// The personal-clipboard doc, kept in its own field rather than the
     /// `rooms` map so it is unconditionally present and `remove` can never

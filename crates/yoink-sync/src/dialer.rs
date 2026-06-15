@@ -30,12 +30,14 @@ const MAX_WS_PAYLOAD: usize = 8 * 1024 * 1024;
 /// to [`MAX_BACKOFF`].
 pub(crate) const REDIAL_DELAY: Duration = INITIAL_BACKOFF;
 
-/// Whether `scope` should be dialed for `peer` at all: the allowlist for the
-/// personal scope; for a room, our own membership plus the peer advertising
-/// the room over mDNS (the allowlist deliberately plays no part in rooms).
+/// Whether `scope` should be dialed for `peer` at all: the personal scope
+/// trusts the LAN by default (blocked devices excluded) or uses the allowlist
+/// under `--require-pairing`; for a room, our own membership plus the peer
+/// advertising the room over mDNS (device trust deliberately plays no part in
+/// rooms).
 fn scope_eligible(state: &State, peer: &PeerInfo, scope: &Scope) -> bool {
     match scope {
-        Scope::Devices => state.allowed.contains(&peer.device_id),
+        Scope::Devices => state.devices_trusted(&peer.device_id),
         Scope::Room(name) => {
             state.joined.contains(name) && peer.rooms.iter().any(|room| room == name)
         }

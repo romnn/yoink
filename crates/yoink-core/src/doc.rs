@@ -144,10 +144,10 @@ impl ClipDoc {
     /// Encode every change the remote peer (identified by its state vector)
     /// has not seen yet, *including* pending updates parked for missing
     /// dependencies (matching yrs' own `DefaultProtocol::handle_sync_step1`).
-    /// This matters with partial allowlists: in an A<->B<->C line topology B
-    /// relays everything it holds, and if parked updates were excluded
-    /// (`encode_diff_v1`) they would be invisible to C until B happened to
-    /// integrate them.
+    /// This matters with partial trust graphs (for example, strict-pairing
+    /// A<->B<->C): B relays everything it holds, and if parked updates were
+    /// excluded (`encode_diff_v1`) they would be invisible to C until B
+    /// happened to integrate them.
     ///
     /// # Errors
     ///

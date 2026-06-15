@@ -163,14 +163,16 @@ impl SyncManager {
             let mut state = self.state.lock();
             let keepalive = state.keepalive;
             let accepted = match &peer.scope {
-                // Rooms are open spaces: membership, not the device
-                // allowlist, is what gates them.
-                Scope::Devices => state.allowed.contains(&peer.device_id),
+                // Rooms are open spaces: membership, not device trust, gates
+                // them. The personal scope trusts the LAN by default (only
+                // blocked devices are refused) unless `--require-pairing`.
+                Scope::Devices => state.devices_trusted(&peer.device_id),
                 Scope::Room(name) => state.joined.contains(name),
             };
             if !accepted {
                 let reason = match &peer.scope {
-                    Scope::Devices => "refusing un-allowed device",
+                    Scope::Devices if state.require_pairing => "refusing unpaired device",
+                    Scope::Devices => "refusing blocked device",
                     Scope::Room(_) => "refusing a room we have not joined",
                 };
                 (Err(reason), None, keepalive)
@@ -366,7 +368,7 @@ impl SyncManager {
             let mut state = self.state.lock();
             match state.connections.get(key) {
                 Some(handle) if handle.generation == generation => state.connections.remove(key),
-                // Someone else (set_allowed, leave_room, a wedged-peer
+                // Someone else (set_trusted, leave_room, a wedged-peer
                 // force-close, or a takeover) already removed this connection
                 // and dealt with the disconnect event.
                 _ => None,

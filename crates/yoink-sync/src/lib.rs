@@ -33,11 +33,13 @@
 //! mismatched protocol version, a scope other than the one it dialed, or a
 //! peer it does not accept in that scope closes the socket — **no document
 //! data may be sent before the peer's HELLO has been validated**.
-//! Acceptance is scope-specific: a `devices` HELLO is accepted only from a
-//! device id on the local allowlist (so personal sync happens iff *both*
-//! devices allow each other), while a `room:{name}` HELLO is accepted iff
-//! this instance currently has that room joined. The device allowlist
-//! deliberately does not govern rooms — open join is the design. A valid
+//! Acceptance is scope-specific. By default the LAN is trusted: a `devices`
+//! HELLO is accepted from any device not explicitly blocked. With
+//! `--require-pairing` it flips to an allowlist — accepted only from an
+//! explicitly paired device id (so personal sync happens iff *both* devices
+//! paired each other). A `room:{name}` HELLO is accepted iff this instance
+//! currently has that room joined; device trust deliberately does not govern
+//! rooms — open join is the design. A valid
 //! HELLO for a `(device id, scope)` pair that already has a connection
 //! *takes over*: the existing connection is assumed to be a zombie (the
 //! peer restarted or gave up on it) and is torn down in favor of the new
@@ -70,8 +72,9 @@
 //! Both sides of a peer pair may discover each other, so to avoid duplicate
 //! connections only the side with the lexicographically *smaller* device id
 //! dials; the other side waits for the inbound connection. Dialing is per
-//! `(peer, scope)`: a peer is dialed in the `devices` scope when it is on
-//! the local allowlist, and in a room scope when the room is in our joined
+//! `(peer, scope)`: a peer is dialed in the `devices` scope when it is
+//! trusted (not blocked by default, or paired under `--require-pairing`), and
+//! in a room scope when the room is in our joined
 //! set *and* the peer advertises that room over mDNS. Failed attempts —
 //! TCP/WebSocket errors, handshake failures, and connections closed before
 //! the peer's first post-HELLO frame (i.e. the peer refused us) — retry with
@@ -79,10 +82,11 @@
 //! discovered, eligible in that scope and disconnected; after an established
 //! connection ends the dialer retries after 1s with the backoff reset.
 //!
-//! De-allowing a device hangs up and stops dialing only its `devices`-scope
-//! connection; room connections to the same device survive, because the
-//! allowlist does not govern rooms. Leaving a room cancels the room's dial
-//! loops and hangs up all its connections.
+//! Distrusting a device (blocking it, or unpairing it under
+//! `--require-pairing`) hangs up and stops dialing only its `devices`-scope
+//! connection; room connections to the same device survive, because trust
+//! does not govern rooms. Leaving a room cancels the room's dial loops and
+//! hangs up all its connections.
 
 mod connection;
 mod dialer;
@@ -134,7 +138,7 @@ pub enum SyncEvent {
         scope: Scope,
     },
     /// A previously-announced connection in `scope` ended (peer hung up, was
-    /// de-allowed, the room was left, or it was force-closed as wedged).
+    /// distrusted, the room was left, or it was force-closed as wedged).
     PeerDisconnected {
         /// Stable id of the peer device whose connection ended.
         device_id: String,
@@ -143,12 +147,12 @@ pub enum SyncEvent {
     },
 }
 
-/// Owns all peer connections (inbound and dialed), the allowlist and the
-/// joined-room set.
+/// Owns all peer connections (inbound and dialed), the personal-scope trust
+/// state and the joined-room set.
 ///
-/// Discovery, allowlist and room-membership changes are pushed in by the app
+/// Discovery, device-trust and room-membership changes are pushed in by the app
 /// loop via [`SyncManager::peer_discovered`] / [`SyncManager::peer_lost`] /
-/// [`SyncManager::set_allowed`] / [`SyncManager::join_room`] /
+/// [`SyncManager::set_trusted`] / [`SyncManager::join_room`] /
 /// [`SyncManager::leave_room`]; the manager reacts by dialing, hanging up,
 /// or accepting connections.
 pub struct SyncManager {
@@ -164,6 +168,20 @@ pub struct SyncManager {
     generation: AtomicU64,
 }
 
+/// How the personal-clipboard (`Devices`) scope decides which peers may sync,
+/// seeded from CLI flags and persisted config.
+#[derive(Debug, Clone, Default)]
+pub struct TrustSettings {
+    /// Use the strict allowlist model (`--require-pairing`): peers must be
+    /// explicitly paired. When false (default) the LAN is trusted and only
+    /// blocked peers are refused.
+    pub require_pairing: bool,
+    /// Devices explicitly paired; consulted only under `require_pairing`.
+    pub allowed: HashSet<String>,
+    /// Devices explicitly blocked; consulted only in the default trust model.
+    pub blocked: HashSet<String>,
+}
+
 /// Connections and dial loops are keyed per peer *and* scope: one device may
 /// hold a devices connection and several room connections at once, each
 /// syncing its own document.
@@ -171,7 +189,14 @@ pub(crate) type ConnKey = (String, Scope);
 
 #[derive(Default)]
 struct State {
+    /// When true (`--require-pairing`) the personal scope is an allowlist
+    /// gated by `allowed`; when false (default) the LAN is trusted and only
+    /// `blocked` keeps a device out.
+    require_pairing: bool,
+    /// Devices explicitly paired, consulted only under `require_pairing`.
     allowed: HashSet<String>,
+    /// Devices explicitly blocked, consulted only in the default trust model.
+    blocked: HashSet<String>,
     /// Names of the rooms this instance currently has open. Governs which
     /// room HELLOs are accepted and which room scopes are dialed.
     joined: HashSet<String>,
@@ -183,6 +208,19 @@ struct State {
     /// the manager, room entries come and go with join/leave.
     fan_outs: HashMap<Scope, watch::Sender<()>>,
     keepalive: Keepalive,
+}
+
+impl State {
+    /// Whether `device_id` may sync the personal clipboard with us under the
+    /// active trust model: allowlisted under `require_pairing`, otherwise
+    /// trusted unless explicitly blocked.
+    fn devices_trusted(&self, device_id: &str) -> bool {
+        if self.require_pairing {
+            self.allowed.contains(device_id)
+        } else {
+            !self.blocked.contains(device_id)
+        }
+    }
 }
 
 /// Keepalive timing, kept in state (rather than as bare consts at the use
@@ -226,8 +264,9 @@ struct DialerHandle {
 }
 
 impl SyncManager {
-    /// `allowed` and `joined_rooms` seed the allowlist and room membership
-    /// from persisted config; every seeded room is joined exactly as if
+    /// `trust` seeds the personal-scope trust model (allowlist vs. trust-the-
+    /// LAN, plus the persisted paired/blocked sets) and `joined_rooms` the
+    /// room membership; every seeded room is joined exactly as if
     /// [`SyncManager::join_room`] had been called (its doc is created in
     /// `docs` when missing and its fan-out task starts).
     ///
@@ -236,7 +275,7 @@ impl SyncManager {
     pub fn new(
         docs: Arc<DocSet>,
         device: DeviceInfo,
-        allowed: HashSet<String>,
+        trust: TrustSettings,
         joined_rooms: &HashSet<String>,
     ) -> (Arc<Self>, mpsc::Receiver<SyncEvent>) {
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
@@ -244,7 +283,9 @@ impl SyncManager {
             docs,
             device,
             state: Mutex::new(State {
-                allowed,
+                require_pairing: trust.require_pairing,
+                allowed: trust.allowed,
+                blocked: trust.blocked,
                 ..State::default()
             }),
             events: events_tx,
@@ -273,43 +314,89 @@ impl SyncManager {
         };
     }
 
-    /// Allow or disallow syncing with a device in the `devices` scope.
-    /// Disallowing disconnects any live devices-scope connection; allowing
-    /// dials if the peer is currently discovered (and the dial rule says we
-    /// are the dialer). Room connections to the same device are unaffected
-    /// either way — the allowlist does not govern rooms.
-    pub fn set_allowed(&self, device_id: &str, allowed: bool) {
-        if allowed {
-            self.state.lock().allowed.insert(device_id.to_string());
-            self.maybe_spawn_dialer(device_id, &Scope::Devices);
-            return;
-        }
+    /// Change whether `device_id` is trusted for the `devices` scope. Under
+    /// the default trust model this unblocks (`trusted = true`) or blocks it;
+    /// under `--require-pairing` it pairs or unpairs it. Becoming distrusted
+    /// disconnects any live devices-scope connection and stops dialing;
+    /// becoming trusted dials if the peer is currently discovered (and the
+    /// dial rule elects us). Room connections to the same device are
+    /// unaffected either way — trust does not govern rooms.
+    pub fn set_trusted(&self, device_id: &str, trusted: bool) {
         let key: ConnKey = (device_id.to_string(), Scope::Devices);
-        let (connection, dialer) = {
+        let teardown = {
             let mut state = self.state.lock();
-            state.allowed.remove(device_id);
-            (state.connections.remove(&key), state.dialers.remove(&key))
+            if state.require_pairing {
+                if trusted {
+                    state.allowed.insert(device_id.to_string());
+                } else {
+                    state.allowed.remove(device_id);
+                }
+            } else if trusted {
+                state.blocked.remove(device_id);
+            } else {
+                state.blocked.insert(device_id.to_string());
+            }
+            if state.devices_trusted(device_id) {
+                None
+            } else {
+                Some((state.connections.remove(&key), state.dialers.remove(&key)))
+            }
         };
-        if let Some(dialer) = dialer {
-            let _ = dialer.cancel.send(());
-        }
-        if let Some(connection) = connection {
-            self.drop_connection(&key, &connection);
+        match teardown {
+            // Now trusted: dial if the peer is discovered and the rule elects us.
+            None => self.maybe_spawn_dialer(device_id, &Scope::Devices),
+            // Now distrusted: drop the live connection and stop dialing.
+            Some((connection, dialer)) => {
+                if let Some(dialer) = dialer {
+                    let _ = dialer.cancel.send(());
+                }
+                if let Some(connection) = connection {
+                    self.drop_connection(&key, &connection);
+                }
+            }
         }
     }
 
-    /// Whether `device_id` is on the `devices`-scope allowlist (i.e. we are
-    /// willing to sync the personal clipboard with it).
+    /// Whether `device_id` is currently trusted for the `devices` scope under
+    /// the active model (paired under `--require-pairing`, otherwise simply
+    /// not blocked).
     #[must_use]
-    pub fn is_allowed(&self, device_id: &str) -> bool {
-        self.state.lock().allowed.contains(device_id)
+    pub fn is_trusted(&self, device_id: &str) -> bool {
+        self.state.lock().devices_trusted(device_id)
     }
 
-    /// Snapshot of the current `devices`-scope allowlist, for persisting it or
-    /// rendering it in the UI.
+    /// Whether the strict allowlist model (`--require-pairing`) is active.
+    #[must_use]
+    pub fn require_pairing(&self) -> bool {
+        self.state.lock().require_pairing
+    }
+
+    /// Whether `device_id` has been explicitly listed — paired under
+    /// `--require-pairing`, blocked otherwise. Such devices stay in the UI
+    /// registry even after their mDNS announcement disappears so the user can
+    /// still unpair/unblock them.
+    #[must_use]
+    pub fn is_explicitly_listed(&self, device_id: &str) -> bool {
+        let state = self.state.lock();
+        if state.require_pairing {
+            state.allowed.contains(device_id)
+        } else {
+            state.blocked.contains(device_id)
+        }
+    }
+
+    /// Snapshot of the explicitly paired devices (allowlist model), for
+    /// persisting to config.
     #[must_use]
     pub fn allowed(&self) -> HashSet<String> {
         self.state.lock().allowed.clone()
+    }
+
+    /// Snapshot of the explicitly blocked devices (default trust model), for
+    /// persisting to config.
+    #[must_use]
+    pub fn blocked(&self) -> HashSet<String> {
+        self.state.lock().blocked.clone()
     }
 
     /// Device ids with a live, handshake-complete connection in `scope`.
@@ -317,9 +404,9 @@ impl SyncManager {
         self.state
             .lock()
             .connections
-            .keys()
-            .filter(|(_, connection_scope)| connection_scope == scope)
-            .map(|(device_id, _)| device_id.clone())
+            .iter()
+            .filter(|((_, connection_scope), handle)| connection_scope == scope && handle.announced)
+            .map(|((device_id, _), _)| device_id.clone())
             .collect()
     }
 
@@ -331,8 +418,8 @@ impl SyncManager {
     /// since an unsanitizable name can never round-trip the wire encoding.
     ///
     /// The room doc itself is *not* removed by [`SyncManager::leave_room`];
-    /// the app owns doc lifecycle (it snapshots rooms to disk before
-    /// dropping them from the [`DocSet`]).
+    /// the app owns doc lifecycle (currently dropping room docs on leave,
+    /// because history is in-memory only).
     pub fn join_room(&self, name: &str) {
         if sanitize_room_name(name).as_deref() != Some(name) {
             tracing::warn!(room = name, "ignoring join for unsanitized room name");

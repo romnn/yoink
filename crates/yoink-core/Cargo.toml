@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 parking_lot = { workspace = true }
 serde = { workspace = true }
+strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

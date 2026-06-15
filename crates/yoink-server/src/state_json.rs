@@ -3,7 +3,7 @@
 use crate::{PeerView, ServerCtx, Settings};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use yoink_core::{ClipEntry, DeviceInfo, Scope};
+use yoink_core::{ClipEntry, DeviceInfo, Scope, ShareMode};
 
 /// UI cap; the document itself keeps up to `yoink_core::MAX_HISTORY` entries.
 const MAX_UI_ENTRIES: usize = 100;
@@ -19,12 +19,14 @@ struct StateJson<'a> {
     entries: Vec<ClipEntry>,
 }
 
-/// Mirror of [`Settings`] so the wire shape stays fixed even if the public
-/// struct grows fields the UI should not see.
+/// Wire settings shape. Most fields come from [`Settings`], but
+/// `require_pairing` is read from the sync manager so device-trust state has a
+/// single source of truth.
 #[derive(Serialize)]
 struct SettingsJson {
-    auto_apply: bool,
     clipboard_available: bool,
+    mode: ShareMode,
+    require_pairing: bool,
 }
 
 #[derive(Serialize)]
@@ -32,8 +34,10 @@ struct PeerJson {
     id: String,
     name: String,
     online: bool,
-    allowed: bool,
     connected: bool,
+    /// Whether we will sync the personal clipboard with this device under the
+    /// active model (paired under `--require-pairing`, otherwise not blocked).
+    trusted: bool,
 }
 
 #[derive(Serialize)]
@@ -76,12 +80,21 @@ pub(crate) fn build_state(ctx: &ServerCtx, scope: &Scope) -> serde_json::Value {
     } else {
         ctx.sync.connected(&Scope::Devices)
     };
+    let require_pairing = ctx.sync.require_pairing();
+    // The explicitly-listed devices: paired under `--require-pairing`,
+    // otherwise blocked. `trusted` is then `require_pairing == contains`.
+    let explicit = if require_pairing {
+        ctx.sync.allowed()
+    } else {
+        ctx.sync.blocked()
+    };
     StateSnapshot {
         device: &ctx.device,
         settings: &settings,
         scope,
         registry: &registry,
-        allowed: &ctx.sync.allowed(),
+        require_pairing,
+        explicit: &explicit,
         devices_connected: &devices_connected,
         scope_connected: &scope_connected,
         joined: &joined,
@@ -98,7 +111,12 @@ struct StateSnapshot<'a> {
     settings: &'a Settings,
     scope: &'a Scope,
     registry: &'a HashMap<String, PeerView>,
-    allowed: &'a HashSet<String>,
+    /// Strict pairing model active? Decides how `explicit` is read: a peer is
+    /// trusted iff `require_pairing == explicit.contains(id)`.
+    require_pairing: bool,
+    /// Explicitly-listed device ids — paired under `require_pairing`, blocked
+    /// otherwise.
+    explicit: &'a HashSet<String>,
     /// Device ids with a live `devices`-scope connection.
     devices_connected: &'a HashSet<String>,
     /// Device ids with a live connection in `scope`.
@@ -118,20 +136,22 @@ impl StateSnapshot<'_> {
                 id: view.info.device_id.clone(),
                 name: view.info.name.clone(),
                 online: view.online,
-                allowed: self.allowed.contains(&view.info.device_id),
                 connected: self.devices_connected.contains(&view.info.device_id),
+                trusted: self.require_pairing == self.explicit.contains(&view.info.device_id),
             })
             .collect();
-        // Allowed-but-never-seen devices must still show up so the user can
-        // revoke them; without a last-seen name the id is all we have.
-        for id in self.allowed {
+        // Explicitly-listed but not currently discovered devices still show up
+        // so the user can unpair/unblock them; without a last-seen name the id
+        // is all we have. (Paired-offline under `--require-pairing`;
+        // blocked-offline in the default trust model.)
+        for id in self.explicit {
             if !self.registry.contains_key(id) {
                 peers.push(PeerJson {
                     id: id.clone(),
                     name: id.clone(),
                     online: false,
-                    allowed: true,
                     connected: self.devices_connected.contains(id),
+                    trusted: self.require_pairing == self.explicit.contains(id),
                 });
             }
         }
@@ -183,8 +203,9 @@ impl StateSnapshot<'_> {
             device: self.device,
             scope: self.scope.to_string(),
             settings: SettingsJson {
-                auto_apply: self.settings.auto_apply,
                 clipboard_available: self.settings.clipboard_available,
+                mode: self.settings.mode,
+                require_pairing: self.require_pairing,
             },
             peers,
             rooms: RoomsJson {
@@ -216,13 +237,6 @@ mod tests {
         }
     }
 
-    fn settings() -> Settings {
-        Settings {
-            auto_apply: true,
-            clipboard_available: false,
-        }
-    }
-
     fn peer_view(id: &str, name: &str, online: bool, rooms: &[&str]) -> PeerView {
         PeerView {
             info: PeerInfo {
@@ -250,7 +264,9 @@ mod tests {
     struct Fixture {
         scope: Scope,
         registry: HashMap<String, PeerView>,
-        allowed: HashSet<String>,
+        require_pairing: bool,
+        /// Paired devices when `require_pairing`, blocked devices otherwise.
+        explicit: HashSet<String>,
         devices_connected: HashSet<String>,
         scope_connected: HashSet<String>,
         joined: BTreeSet<String>,
@@ -262,7 +278,8 @@ mod tests {
             Self {
                 scope: Scope::Devices,
                 registry: HashMap::new(),
-                allowed: HashSet::new(),
+                require_pairing: false,
+                explicit: HashSet::new(),
                 devices_connected: HashSet::new(),
                 scope_connected: HashSet::new(),
                 joined: BTreeSet::new(),
@@ -274,13 +291,17 @@ mod tests {
     impl Fixture {
         fn build(self) -> serde_json::Value {
             let dev = device();
-            let settings = settings();
+            let settings = Settings {
+                mode: ShareMode::Manual,
+                clipboard_available: false,
+            };
             StateSnapshot {
                 device: &dev,
                 settings: &settings,
                 scope: &self.scope,
                 registry: &self.registry,
-                allowed: &self.allowed,
+                require_pairing: self.require_pairing,
+                explicit: &self.explicit,
                 devices_connected: &self.devices_connected,
                 scope_connected: &self.scope_connected,
                 joined: &self.joined,
@@ -303,7 +324,8 @@ mod tests {
         );
         let state = Fixture {
             registry,
-            allowed: ["p-online".to_string(), "p-ghost".to_string()].into(),
+            require_pairing: true,
+            explicit: ["p-online".to_string(), "p-ghost".to_string()].into(),
             devices_connected: ["p-online".to_string()].into(),
             scope_connected: ["p-online".to_string()].into(),
             entries: vec![entry("e1", "older", 1000), entry("e2", "newer", 2000)],
@@ -314,7 +336,8 @@ mod tests {
         assert_eq!(state["device"]["id"], "dev-self");
         assert_eq!(state["device"]["name"], "my-laptop");
         assert_eq!(state["scope"], "devices");
-        assert_eq!(state["settings"]["auto_apply"], true);
+        assert_eq!(state["settings"]["mode"], "manual");
+        assert_eq!(state["settings"]["require_pairing"], true);
         assert_eq!(state["settings"]["clipboard_available"], false);
         assert_eq!(state["rooms"]["joined"].as_array().unwrap().len(), 0);
         assert_eq!(state["rooms"]["network"].as_array().unwrap().len(), 0);
@@ -332,20 +355,20 @@ mod tests {
         let online = by_id("p-online");
         assert_eq!(online["name"], "Alpha");
         assert_eq!(online["online"], true);
-        assert_eq!(online["allowed"], true);
+        assert_eq!(online["trusted"], true);
         assert_eq!(online["connected"], true);
 
         let offline = by_id("p-offline");
         assert_eq!(offline["name"], "Bravo");
         assert_eq!(offline["online"], false);
-        assert_eq!(offline["allowed"], false);
+        assert_eq!(offline["trusted"], false);
         assert_eq!(offline["connected"], false);
 
-        // Allowed but never discovered: name falls back to the id.
+        // Paired but never discovered: name falls back to the id.
         let ghost = by_id("p-ghost");
         assert_eq!(ghost["name"], "p-ghost");
         assert_eq!(ghost["online"], false);
-        assert_eq!(ghost["allowed"], true);
+        assert_eq!(ghost["trusted"], true);
         assert_eq!(ghost["connected"], false);
 
         let entries = state["entries"].as_array().unwrap();
@@ -355,6 +378,31 @@ mod tests {
         assert_eq!(entries[0]["device_name"], "my-laptop");
         assert_eq!(entries[0]["created_at_ms"], 2000);
         assert_eq!(entries[1]["id"], "e1");
+    }
+
+    #[test]
+    fn trust_model_marks_unblocked_devices_trusted() {
+        let mut registry = HashMap::new();
+        registry.insert("ok".to_string(), peer_view("ok", "Okay", true, &[]));
+        registry.insert("bad".to_string(), peer_view("bad", "Blocked", true, &[]));
+        let state = Fixture {
+            registry,
+            require_pairing: false,
+            // In the default trust model, `explicit` is the blocklist.
+            explicit: ["bad".to_string(), "gone".to_string()].into(),
+            ..Fixture::default()
+        }
+        .build();
+
+        assert_eq!(state["settings"]["require_pairing"], false);
+        let peers = state["peers"].as_array().unwrap();
+        let by_id = |id: &str| peers.iter().find(|p| p["id"] == id).unwrap();
+        assert_eq!(by_id("ok")["trusted"], true, "unblocked device is trusted");
+        assert_eq!(by_id("bad")["trusted"], false, "blocked device is not");
+        // Blocked but offline still shows so the user can unblock it.
+        let gone = by_id("gone");
+        assert_eq!(gone["online"], false);
+        assert_eq!(gone["trusted"], false);
     }
 
     #[test]
