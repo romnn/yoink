@@ -51,6 +51,7 @@
 //! [`AppCommand`]: yoink_core::AppCommand
 
 mod app;
+mod banner;
 mod config;
 
 use anyhow::Context;
@@ -86,9 +87,10 @@ struct Args {
     #[arg(long)]
     config_dir: Option<std::path::PathBuf>,
 
-    /// Open the web UI in the default browser after startup.
-    #[arg(long)]
-    open: bool,
+    /// Don't open the web UI in your browser on startup (it opens by default).
+    /// Handy for headless machines or running several instances at once.
+    #[arg(long = "no-open")]
+    no_open: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -102,8 +104,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing() {
+    // Default to WARN so normal operation leaves stdout clean (the startup
+    // banner is the only expected output); `RUST_LOG` opts into more.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
@@ -183,10 +187,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     spawn_web_servers(ctx, listener, v6_listener);
 
     let url = format!("http://localhost:{port}");
-    println!("yoink — shared LAN clipboard");
-    println!("  device: {} ({})", device.name, device.id);
-    println!("  web UI: {url}");
-    if args.open
+    banner::print(&url, &device.name, &device.id);
+    if !args.no_open
         && let Err(err) = open::that(&url)
     {
         tracing::warn!(error = %err, "failed to open the web UI in a browser");
