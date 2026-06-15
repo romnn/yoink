@@ -251,6 +251,9 @@ pub(crate) struct App {
     /// Whether received personal-clipboard entries are written to the OS
     /// clipboard automatically (`mirror` mode only).
     pub auto_apply: bool,
+    /// Whether joined room names are advertised over mDNS. False under
+    /// `--untrusted`, so a stranger on the network cannot enumerate our rooms.
+    pub advertise_rooms: bool,
     pub sync: Arc<SyncManager>,
     pub discovery: Discovery,
     pub peers: Arc<parking_lot::RwLock<HashMap<String, PeerView>>>,
@@ -535,7 +538,7 @@ impl App {
             self.config.rooms.insert(pos, name);
         }
         self.persist_config();
-        self.discovery.set_rooms(&self.config.rooms);
+        self.announce_rooms();
         self.notify_ui();
     }
 
@@ -561,8 +564,20 @@ impl App {
         self.joined_rooms.write().remove(&name);
         self.config.rooms.retain(|room| room != &name);
         self.persist_config();
-        self.discovery.set_rooms(&self.config.rooms);
+        self.announce_rooms();
         self.notify_ui();
+    }
+
+    /// Re-announce our joined rooms over mDNS — unless `--untrusted`, where we
+    /// never publish room names in our TXT record. The local room membership
+    /// still exists; it is just not discoverable from our announcement.
+    fn announce_rooms(&self) {
+        let rooms: &[String] = if self.advertise_rooms {
+            &self.config.rooms
+        } else {
+            &[]
+        };
+        self.discovery.set_rooms(rooms);
     }
 
     fn persist_config(&mut self) {

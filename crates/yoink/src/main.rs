@@ -29,9 +29,10 @@
 //!      when the entry was a duplicate) — room adds never do
 //!    - `CopyEntry` → look up entry by id in the scope's doc →
 //!      `clipboard.set_text` (deliberate, so allowed from rooms too)
-//!    - `JoinRoom` → create-or-find the room's doc, start syncing and
-//!      advertising the room, persist it in the config + notify
-//!    - `LeaveRoom` → stop syncing/advertising, drop the doc + notify
+//!    - `JoinRoom` → create-or-find the room's doc, start syncing, advertise
+//!      the room unless `--untrusted`, persist it in the config + notify
+//!    - `LeaveRoom` → stop syncing, update room advertisements, drop the doc
+//!      + notify
 //! 6. Ctrl-C → persist the config, `discovery.shutdown()`, exit.
 //!
 //! Clipboard history is never written to disk: every run starts empty and a
@@ -48,7 +49,8 @@
 //! pair first. Rooms are always open-join regardless. `--mode` selects how
 //! the OS clipboard is involved (manual / auto-share / mirror), and
 //! `--untrusted` is a one-flag hardened preset for networks you don't control
-//! (forces `--require-pairing` + manual mode).
+//! (forces `--require-pairing` + manual mode and stops advertising joined
+//! room names over mDNS).
 //!
 //! Config (`config.toml` in the config dir): `device_id` (created on first
 //! run), optional `name` override, `allowed` (paired devices, used under
@@ -113,9 +115,10 @@ struct Args {
     require_pairing: bool,
 
     /// Harden yoink for a network you don't control (a large shared or public
-    /// LAN). A one-flag conservative preset that forces strict pairing
-    /// (as `--require-pairing`) and manual share mode (`--mode manual`),
-    /// overriding those flags.
+    /// LAN). A one-flag conservative preset: forces strict pairing (as
+    /// `--require-pairing`) and manual share mode (`--mode manual`, overriding
+    /// those flags), and stops advertising your joined room names over mDNS so
+    /// strangers can't enumerate them.
     #[arg(long)]
     untrusted: bool,
 }
@@ -127,13 +130,22 @@ fn parse_mode(s: &str) -> Result<ShareMode, String> {
         .map_err(|_| format!("unknown mode '{s}' (expected: manual, auto-share, mirror)"))
 }
 
-/// Resolve the effective trust model and share mode from the CLI flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EffectiveSettings {
+    require_pairing: bool,
+    mode: ShareMode,
+    advertise_rooms: bool,
+}
+
+/// Resolve the effective trust model, share mode and discovery posture from
+/// the CLI flags.
 ///
 /// `--untrusted` is the hardened preset for networks you don't control: it
 /// forces strict pairing and manual share mode regardless of the matching
-/// individual flags (warning if an explicit `--mode` is overridden). Future
-/// conservative defaults belong here too, so the one flag locks them all.
-fn resolve_hardening(args: &Args) -> (bool, ShareMode) {
+/// individual flags (warning if an explicit `--mode` is overridden), and keeps
+/// joined room names out of mDNS. Future conservative defaults belong here
+/// too, so the one flag locks them all.
+fn resolve_hardening(args: &Args) -> EffectiveSettings {
     let require_pairing = args.require_pairing || args.untrusted;
     let mode = if args.untrusted {
         if args.mode != ShareMode::Manual {
@@ -146,7 +158,19 @@ fn resolve_hardening(args: &Args) -> (bool, ShareMode) {
     } else {
         args.mode
     };
-    (require_pairing, mode)
+    EffectiveSettings {
+        require_pairing,
+        mode,
+        advertise_rooms: !args.untrusted,
+    }
+}
+
+fn rooms_to_advertise(rooms: &[String], effective: EffectiveSettings) -> &[String] {
+    if effective.advertise_rooms {
+        rooms
+    } else {
+        &[]
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -168,7 +192,7 @@ fn init_tracing() {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let (require_pairing, mode) = resolve_hardening(&args);
+    let effective = resolve_hardening(&args);
 
     let config_dir = resolve_config_dir(args.config_dir)?;
     let mut config = Config::load_or_init(&config_dir)?;
@@ -215,17 +239,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let (clipboard, clipboard_rx) = ClipboardHandle::spawn(Duration::from_millis(400));
     let seeded_rooms: std::collections::HashSet<String> = config.rooms.iter().cloned().collect();
     let trust = TrustSettings {
-        require_pairing,
+        require_pairing: effective.require_pairing,
         allowed: config.allowed.iter().cloned().collect(),
         blocked: config.blocked.iter().cloned().collect(),
     };
     let (sync, sync_rx) = SyncManager::new(docs.clone(), device.clone(), trust, &seeded_rooms);
-    let (discovery, discovery_rx) = Discovery::start(&device.id, &device.name, port, &config.rooms)
-        .context("failed to start mDNS peer discovery")?;
+    // Under `--untrusted` we never advertise our joined room names over mDNS,
+    // so a stranger on the network cannot enumerate them.
+    let advertised_rooms = rooms_to_advertise(&config.rooms, effective);
+    let (discovery, discovery_rx) =
+        Discovery::start(&device.id, &device.name, port, advertised_rooms)
+            .context("failed to start mDNS peer discovery")?;
 
     let peers = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let settings = Arc::new(parking_lot::RwLock::new(Settings {
-        mode,
+        mode: effective.mode,
         clipboard_available: clipboard.available(),
     }));
     let joined_rooms = Arc::new(parking_lot::RwLock::new(
@@ -258,8 +286,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         docs,
         device,
         clipboard,
-        auto_capture: mode.captures_clipboard(),
-        auto_apply: mode.auto_applies(),
+        auto_capture: effective.mode.captures_clipboard(),
+        auto_apply: effective.mode.auto_applies(),
+        advertise_rooms: effective.advertise_rooms,
         sync,
         discovery,
         peers,
@@ -353,7 +382,37 @@ fn bind_v6_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
 
 #[cfg(test)]
 mod tests {
-    use super::bind_v6_listener;
+    use super::{Args, EffectiveSettings, bind_v6_listener, resolve_hardening};
+    use clap::Parser as _;
+    use yoink_core::ShareMode;
+
+    #[test]
+    fn untrusted_forces_hardened_effective_settings() {
+        let args = Args::parse_from(["yoink", "--untrusted", "--mode", "mirror"]);
+
+        assert_eq!(
+            resolve_hardening(&args),
+            EffectiveSettings {
+                require_pairing: true,
+                mode: ShareMode::Manual,
+                advertise_rooms: false,
+            }
+        );
+    }
+
+    #[test]
+    fn require_pairing_alone_keeps_room_advertisements() {
+        let args = Args::parse_from(["yoink", "--require-pairing", "--mode", "auto-share"]);
+
+        assert_eq!(
+            resolve_hardening(&args),
+            EffectiveSettings {
+                require_pairing: true,
+                mode: ShareMode::AutoShare,
+                advertise_rooms: true,
+            }
+        );
+    }
 
     #[tokio::test]
     async fn v6_listener_coexists_with_v4_on_the_same_port() {

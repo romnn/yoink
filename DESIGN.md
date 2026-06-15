@@ -37,6 +37,8 @@ The architecture was shaped so rooms are an extension, not a rework:
 - **Discovery**: instances advertise joined room names in their mDNS TXT
   record (capped, sanitized). The UI aggregates peers' advertisements into
   "rooms on this network" so joining is one click, not just typed URLs.
+  `--untrusted` suppresses our own room-name advertisements while still
+  browsing peers' announcements.
 - **Server/UI**: `/` stays the personal clipboard. `/r/{name}` serves a room
   view (same entry-feed UI, share box scoped to the room); unreserved bare
   paths like `/myroom` redirect to `/r/myroom` so typing a room URL just
@@ -58,7 +60,8 @@ entries to the OS clipboard automatically.
 
 The LAN is trusted by default. Device identity is self-asserted over mDNS, so
 a hostile network can impersonate devices or join rooms. `--untrusted` opts
-into the safer preset available today: strict pairing plus manual share mode.
+into the safer preset available today: strict pairing, manual share mode, and
+no mDNS advertisement of our joined room names.
 Mitigations on the roadmap: TOFU device keys for pairing, optional room codes
 that derive an HMAC for the HELLO and an encryption key for frames. The sync
 handshake already enforces "no document data before validation", which is

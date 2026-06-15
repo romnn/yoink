@@ -33,6 +33,11 @@ same path on their own instance and is in. No pairing, no invites — rooms
 show up under "Rooms on this network" on every instance for one-click join,
 and several rooms can be active at once.
 
+Under `--untrusted`, yoink still lets you join and use rooms, but it does not
+advertise your joined room names over mDNS. Other devices will not discover
+your rooms from your announcement; share the room URL out of band when you
+want someone to join.
+
 Rooms are deliberately different from device sharing: your OS clipboard is
 **never** captured into a room or auto-applied from one. Everything in a room
 was put there on purpose, so an open-join space stays safe. Each room keeps
@@ -62,7 +67,8 @@ flow locally.
   unless you explicitly block it. `--require-pairing` flips the personal
   clipboard to a persisted allowlist where both devices must pair each other.
   `--untrusted` is a conservative preset for networks you do not control:
-  strict pairing plus manual share mode.
+  strict pairing, manual share mode, and no mDNS advertisement of your joined
+  room names.
 - **Sync** — the clipboard history lives in a [yrs](https://docs.rs/yrs)
   (Y-CRDT) document. Peers exchange state vectors and diffs over a WebSocket
   and stream incremental updates afterwards, so concurrent copies on several
