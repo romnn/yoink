@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=https://github.com/romnn/micromux/raw/main/micromux.schema.json
+version: "1"
+name: yoink
+restart: unless-stopped
+healthcheck:
+  interval: "2s"
+  timeout: "1s"
+  retries: 10
+
+services:
+  yoink:
+    # A separate config dir and port keep this dev instance from sharing the device id,
+    # pairings and port of a yoink installed on the same machine.
+    command: ["cargo", "run", "-p", "yoink", "--", "--no-open", "--port", "7690", "--config-dir", "target/micromux-config"]
+    healthcheck:
+      # The first `cargo run` compiles before yoink listens; 150 checks 2s apart give a
+      # cold build about five minutes before the service counts as unhealthy.
+      retries: 150
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:7690/ || exit 1"]

@@ -1,1 +1,9 @@
-/target
+.DS_Store
+/target/
+/.task/
+.cooldown.lock
+
+# goreleaser output and zig's compiler probes
+goreleaser-dist/
+.intentionally-empty-file.o
+*_compiler_family.o
