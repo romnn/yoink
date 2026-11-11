@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/SchemaStore/schemastore/refs/heads/master/src/schemas/json/github-workflow.json
+name: release
+on:
+  push:
+    tags:
+      - "*"
+
+env:
+  MISE_GITHUB_TOKEN: ${{ github.token }}
+  MISE_AUTO_INSTALL: "0"
+  MISE_HTTP_RETRIES: "12"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  tests:
+    uses: ./.github/workflows/test.yaml
+
+  release:
+    runs-on: ubuntu-24.04
+    needs: [tests]
+    timeout-minutes: 45
+    outputs:
+      precompiled-binaries: ${{ steps.upload.outputs.artifact-url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Allow CI-only release file churn
+        shell: bash
+        run: |
+          allowed_dirty_files=(
+            mise.lock
+          )
+          git update-index --skip-worktree -- "${allowed_dirty_files[@]}"
+      - uses: jdx/mise-action@v5
+        with:
+          install: false
+          cache: true
+          env: false
+      - run: mise install task
+      - name: Release
+        run: task release
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          TAP_GITHUB_TOKEN: "${{ secrets.TAP_GITHUB_TOKEN }}"
+      - name: Upload precompiled binaries
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: goreleaser-dist
+          path: goreleaser-dist
