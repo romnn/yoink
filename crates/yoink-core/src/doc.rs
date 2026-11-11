@@ -4,7 +4,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
-use yrs::{Array, ArrayRef, Doc, Out, ReadTxn, StateVector, Subscription, Transact, Update};
+use yrs::{Array, ArrayRef, Doc, Out, ReadTxn, StateVector, Transact, Update};
 
 /// An encoded yrs update together with where it came from.
 #[derive(Debug, Clone)]
@@ -29,6 +29,9 @@ pub enum DocError {
     Apply(#[from] yrs::error::UpdateError),
 }
 
+/// Key the update observer is registered under; it lives as long as the doc.
+const UPDATE_OBSERVER_KEY: &str = "yoink-update-broadcast";
+
 /// Thread-safe wrapper around the shared clipboard yrs document.
 ///
 /// All access goes through an internal mutex because yrs transactions demand
@@ -42,7 +45,6 @@ pub struct ClipDoc {
 struct DocState {
     doc: Doc,
     entries: ArrayRef,
-    _observer: Subscription,
 }
 
 impl ClipDoc {
@@ -52,38 +54,34 @@ impl ClipDoc {
     /// # Panics
     ///
     /// Panics if the update observer cannot be registered. This is
-    /// unreachable: registration needs a read transaction, and nothing else
-    /// can hold one on a doc that has not yet escaped this constructor.
+    /// unreachable: registration needs an exclusive transaction, and nothing
+    /// else can hold one on a doc that has not yet escaped this constructor.
     #[must_use]
     pub fn new() -> Self {
         let doc = Doc::new();
         let entries = doc.get_or_insert_array("entries");
         let (updates, _) = broadcast::channel(256);
         let tx = updates.clone();
-        // Cannot fail here: registering the observer acquires a read
+        // Cannot fail here: registering the observer acquires an exclusive
         // transaction and nothing else can hold one on a freshly created doc.
+        // The doc owns the observer, so it is dropped together with the doc.
         #[allow(
             clippy::expect_used,
-            reason = "observer registration only fails when a read txn is already held; impossible on a doc still inside its constructor (see the # Panics section)"
+            reason = "observer registration only fails when another txn is already held; impossible on a doc still inside its constructor (see the # Panics section)"
         )]
-        let observer = doc
-            .observe_update_v1(move |txn, event| {
-                let origin = txn
-                    .origin()
-                    .and_then(|o| std::str::from_utf8(o.as_ref()).ok())
-                    .map(str::to_string);
-                let _ = tx.send(DocUpdate {
-                    update: event.update.clone(),
-                    origin,
-                });
-            })
-            .expect("freshly created doc has no competing transaction");
+        doc.observe_update_v1(UPDATE_OBSERVER_KEY, move |txn, event| {
+            let origin = txn
+                .origin()
+                .and_then(|o| std::str::from_utf8(o.as_ref()).ok())
+                .map(str::to_string);
+            let _ = tx.send(DocUpdate {
+                update: event.update.clone(),
+                origin,
+            });
+        })
+        .expect("freshly created doc has no competing transaction");
         Self {
-            state: Mutex::new(DocState {
-                doc,
-                entries,
-                _observer: observer,
-            }),
+            state: Mutex::new(DocState { doc, entries }),
             updates,
         }
     }
