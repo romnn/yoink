@@ -10,12 +10,13 @@
 //! | `GET /{word}`  | unreserved single-segment shorthand; 307 to `/r/{sanitized word}` so typing `localhost:7679/standup` just works |
 //! | `GET /assets/idiomorph.js` | embedded [idiomorph] DOM-morphing library  |
 //! | `GET /api/state?scope=` | full UI state for one scope as JSON (shape below) |
+//! | `GET /api/remote` | links and QR codes (SVG) for opening the UI on another device; loopback only in every [`UiAccess`] mode |
 //! | `POST /api/command` | body = [`AppCommand`] JSON; enqueues, replies 202 |
 //! | `GET /ws/ui?scope=` | WebSocket; pushes the scoped state JSON on connect and on every app-loop notify |
 //! | `GET /sync`    | WebSocket; peer sync, handed to [`SyncManager::handle_inbound`] |
 //!
 //! `scope` is the string form of [`Scope`](yoink_core::Scope) — `"devices"`
-//! or `"room:{name}"` — defaulting to `devices` when absent; an unparseable
+//! or `"room:{name}"` — defaulting to `devices` when absent; an unparsable
 //! value answers 400. The single-segment words `api`, `ws`, `sync`, `r`,
 //! `assets` and `favicon.ico` are reserved and never treated as room
 //! shorthands.
@@ -26,12 +27,21 @@
 //!
 //! The listeners bind `0.0.0.0` (plus a best-effort `[::]` one) so peers can
 //! reach `/sync`, therefore every *other* route — room views and redirects
-//! included — must reject non-loopback clients (check
-//! `ConnectInfo<SocketAddr>`; both `127.0.0.0/8` and `::1`). Only `/sync` is
-//! reachable from the LAN, and it never reveals document data before the
-//! sync handshake validates the peer. Both WebSocket routes cap message and
-//! frame size at 8 MiB so a stranger cannot make us buffer unbounded frames
-//! before that validation.
+//! included — is guarded by [`UiAccess`], judged from
+//! `ConnectInfo<SocketAddr>`. Loopback clients (`127.0.0.0/8` and `::1`)
+//! always pass. Under the default [`UiAccess::LoopbackOnly`] every other
+//! client is refused, so only `/sync` is reachable from the LAN, and it never
+//! reveals document data before the sync handshake validates the peer.
+//! The guard first refuses requests a browser may have made on behalf of
+//! another website: a cross-site `Origin`, or a public DNS name in `Host`
+//! (DNS rebinding). Without that, any page open in a local browser could
+//! drive the API or read the history over the UI WebSocket.
+//! [`UiAccess::Remote`] admits other devices too, with the secret token
+//! ([`RemoteAuth::Token`]) or without any check ([`RemoteAuth::Open`]); the
+//! `access` module documents the token flow. `/api/remote` hands out the
+//! token, so it stays loopback-only in every mode. Both WebSocket routes cap
+//! message and frame size at 8 MiB so a stranger cannot make us buffer
+//! unbounded frames before that validation.
 //!
 //! # State JSON shape
 //!
@@ -63,9 +73,13 @@
 //! connection in that room. `entries` is newest-first, capped at 100 for
 //! the UI, and empty when the scope has no document (room not joined).
 
-mod loopback;
+mod access;
+mod remote;
 mod routes;
+mod same_origin;
 mod state_json;
+
+pub use access::{RemoteAccess, RemoteAuth, UiAccess, UiToken};
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -128,13 +142,20 @@ pub struct ServerCtx {
 
 /// Serve until the listener fails or the task is cancelled.
 ///
+/// `access` decides who besides this machine may use the web UI and API; `/sync` is
+/// reachable from the network regardless.
+///
 /// # Errors
 ///
 /// Propagates the error from [`axum::serve`] if accepting connections fails
 /// (e.g. the listening socket is closed out from under it).
-pub async fn serve(listener: tokio::net::TcpListener, ctx: ServerCtx) -> anyhow::Result<()> {
-    let app = routes::router(ctx);
-    // Connect info is what lets the loopback guard tell local browsers apart
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    ctx: ServerCtx,
+    access: UiAccess,
+) -> anyhow::Result<()> {
+    let app = routes::router(ctx, access);
+    // Connect info is what lets the access guard tell local browsers apart
     // from LAN peers, so it must be wired in here and not be optional.
     axum::serve(
         listener,

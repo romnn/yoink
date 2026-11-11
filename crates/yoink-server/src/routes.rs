@@ -1,7 +1,8 @@
 //! Router assembly and the (deliberately thin) HTTP/WebSocket handlers.
 
 use crate::ServerCtx;
-use crate::loopback::require_loopback;
+use crate::access::{UiAccess, guard_ui, require_loopback};
+use crate::remote::remote_links;
 use crate::state_json::build_state;
 use axum::Router;
 use axum::body::Bytes;
@@ -12,6 +13,7 @@ use axum::middleware;
 use axum::response::{Html, IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
+use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
 use yoink_core::{AppCommand, Scope, sanitize_room_name};
 
@@ -34,8 +36,18 @@ const RESERVED_PATHS: &[&str] = &["api", "ws", "sync", "r", "assets", "favicon.i
 /// memory use.
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
-pub(crate) fn router(ctx: ServerCtx) -> Router {
+pub(crate) fn router(ctx: ServerCtx, access: UiAccess) -> Router {
+    let access = Arc::new(access);
     Router::new()
+        // The links carry the token, so they stay on this machine whatever the access mode.
+        .route(
+            "/api/remote",
+            get({
+                let access = Arc::clone(&access);
+                move || remote_links(access)
+            }),
+        )
+        .layer(middleware::from_fn(require_loopback))
         .route("/", get(index))
         .route("/r/{name}", get(room_page))
         .route("/assets/idiomorph.js", get(idiomorph_js))
@@ -45,7 +57,7 @@ pub(crate) fn router(ctx: ServerCtx) -> Router {
         // Static segments win over captures in axum's router, so this only
         // sees paths no explicit route claims.
         .route("/{word}", get(bare_room_redirect))
-        .layer(middleware::from_fn(require_loopback))
+        .layer(middleware::from_fn_with_state(access, guard_ui))
         // Added after the guard layer on purpose: `/sync` must stay reachable
         // from the LAN; the sync handshake itself enforces device trust.
         .route("/sync", get(sync))
@@ -121,7 +133,22 @@ async fn api_state(State(ctx): State<ServerCtx>, Query(query): Query<ScopeQuery>
 /// Parses the body by hand instead of using the `Json` extractor so that any
 /// malformed input (wrong content type, unknown `cmd`, syntax error) yields a
 /// uniform 400 instead of a mix of 400/415/422.
-async fn api_command(State(ctx): State<ServerCtx>, body: Bytes) -> Response {
+///
+/// The JSON content type is required, not just tolerated: another website can
+/// only send it after a CORS preflight, which this server never approves, so
+/// even a browser that omits `Origin` cannot forge a command.
+async fn api_command(
+    State(ctx): State<ServerCtx>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !is_json(&headers) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid command: content type must be application/json",
+        )
+            .into_response();
+    }
     let cmd: AppCommand = match serde_json::from_slice(&body) {
         Ok(cmd) => cmd,
         Err(err) => {
@@ -133,6 +160,14 @@ async fn api_command(State(ctx): State<ServerCtx>, body: Bytes) -> Response {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     StatusCode::ACCEPTED.into_response()
+}
+
+fn is_json(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
 }
 
 async fn ws_ui(
@@ -197,6 +232,7 @@ async fn sync(State(ctx): State<ServerCtx>, ws: WebSocketUpgrade) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::{RemoteAccess, RemoteAuth, UiToken};
     use crate::{PeerView, Settings};
     use axum::body::Body;
     use axum::extract::ConnectInfo;
@@ -210,9 +246,24 @@ mod tests {
     use yoink_discovery::PeerInfo;
     use yoink_sync::{SyncManager, TrustSettings};
 
-    /// A full production router around a self-contained [`ServerCtx`].
+    /// A full production router around a self-contained [`ServerCtx`], serving the UI to
+    /// this machine only.
     /// Must be called from a tokio runtime ([`SyncManager::new`] spawns).
     fn test_app() -> (Router, ServerCtx) {
+        test_app_with(UiAccess::LoopbackOnly)
+    }
+
+    /// [`test_app`] with remote devices admitted as `auth` allows.
+    fn remote_app(auth: RemoteAuth) -> Router {
+        let access = UiAccess::Remote(RemoteAccess {
+            auth,
+            addresses: vec!["192.168.1.5:7679".parse().expect("test addr")],
+        });
+        let (app, _ctx) = test_app_with(access);
+        app
+    }
+
+    fn test_app_with(access: UiAccess) -> (Router, ServerCtx) {
         let docs = Arc::new(DocSet::new());
         let device = DeviceInfo {
             id: "dev-self".into(),
@@ -239,12 +290,19 @@ mod tests {
             commands,
             notify,
         };
-        (router(ctx.clone()), ctx)
+        (router(ctx.clone(), access), ctx)
     }
 
+    /// A request from `peer` as a browser sends it: `Host` names the loopback
+    /// server for a local peer and the LAN address otherwise.
     fn request(path: &str, peer: Option<&str>) -> Request<Body> {
+        let host = match peer {
+            Some(peer) if peer.starts_with("127.") || peer.starts_with("[::") => "localhost:7679",
+            _ => "192.168.1.5:7679",
+        };
         let mut req = Request::builder()
             .uri(path)
+            .header(header::HOST, host)
             .body(Body::empty())
             .expect("test request");
         if let Some(peer) = peer {
@@ -330,6 +388,259 @@ mod tests {
         // Not a WebSocket handshake, so the upgrade is rejected — but with a
         // handler error, not the guard's 403.
         assert_ne!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    const LAN_PEER: &str = "192.168.1.20:5000";
+
+    fn with_cookie(mut request: Request<Body>, cookie: &str) -> Request<Body> {
+        request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().expect("test cookie header"));
+        request
+    }
+
+    /// Opening the secret link from another device sets the cookie, strips the token from
+    /// the address bar, and the cookie then admits the page, the API and the UI socket.
+    #[tokio::test]
+    async fn token_link_trades_the_token_for_a_cookie() {
+        let token = UiToken::generate().unwrap();
+        let app = remote_app(RemoteAuth::Token(token.clone()));
+
+        // Opening the link redirects to the same page without the token.
+        let link = format!("/r/attic?token={}", token.as_str());
+        let res = app
+            .clone()
+            .oneshot(request(&link, Some(LAN_PEER)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&res), "/r/attic");
+        let set_cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(set_cookie.starts_with(&format!("yoink_ui_token={};", token.as_str())));
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Lax"));
+
+        // The cookie alone then admits every guarded route.
+        let cookie = format!("yoink_ui_token={}", token.as_str());
+        for path in ["/r/attic", "/api/state", "/assets/idiomorph.js"] {
+            let res = app
+                .clone()
+                .oneshot(with_cookie(request(path, Some(LAN_PEER)), &cookie))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_mode_rejects_remote_clients_without_a_valid_token() {
+        let token = UiToken::generate().unwrap();
+        let wrong = UiToken::generate().unwrap();
+        let app = remote_app(RemoteAuth::Token(token.clone()));
+
+        // No credentials, a wrong link, and a wrong cookie are all refused.
+        let wrong_link = format!("/?token={}", wrong.as_str());
+        let wrong_cookie = format!("yoink_ui_token={}", wrong.as_str());
+        let requests = [
+            request("/", Some(LAN_PEER)),
+            request("/api/state", Some(LAN_PEER)),
+            request(&wrong_link, Some(LAN_PEER)),
+            with_cookie(request("/api/state", Some(LAN_PEER)), &wrong_cookie),
+        ];
+        for req in requests {
+            let path = req.uri().to_string();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    /// The query token only ever sets the cookie through a page load; it never
+    /// authorizes a command directly.
+    #[tokio::test]
+    async fn token_in_the_query_does_not_authorize_commands() {
+        let token = UiToken::generate().unwrap();
+        let app = remote_app(RemoteAuth::Token(token.clone()));
+        let mut req = request(
+            &format!("/api/command?token={}", token.as_str()),
+            Some(LAN_PEER),
+        );
+        *req.method_mut() = axum::http::Method::POST;
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_mode_still_admits_loopback_without_a_token() {
+        let app = remote_app(RemoteAuth::Token(UiToken::generate().unwrap()));
+        let res = app.oneshot(local_request("/api/state")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_mode_fails_closed_without_connect_info() {
+        let token = UiToken::generate().unwrap();
+        let app = remote_app(RemoteAuth::Token(token.clone()));
+        let link = format!("/?token={}", token.as_str());
+        let res = app.oneshot(request(&link, None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn open_mode_admits_remote_clients_without_credentials() {
+        let app = remote_app(RemoteAuth::Open);
+        for path in ["/", "/r/attic", "/api/state"] {
+            let res = app
+                .clone()
+                .oneshot(request(path, Some(LAN_PEER)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    /// The remote links carry the token, so even an authorized remote browser must not be
+    /// able to read them back.
+    #[tokio::test]
+    async fn remote_links_stay_on_this_machine() {
+        let token = UiToken::generate().unwrap();
+        let app = remote_app(RemoteAuth::Token(token.clone()));
+        let cookie = format!("yoink_ui_token={}", token.as_str());
+        let res = app
+            .clone()
+            .oneshot(with_cookie(request("/api/remote", Some(LAN_PEER)), &cookie))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        let open = remote_app(RemoteAuth::Open);
+        let res = open
+            .oneshot(request("/api/remote", Some(LAN_PEER)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn remote_links_list_each_link_with_a_qr_code() {
+        let token = UiToken::generate().unwrap();
+        let app = remote_app(RemoteAuth::Token(token.clone()));
+        let res = app.oneshot(local_request("/api/remote")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let remote = json_body(res).await;
+        assert_eq!(remote["auth"], "token");
+        assert_eq!(
+            remote["links"][0]["url"],
+            format!("http://192.168.1.5:7679/?token={}", token.as_str())
+        );
+        assert!(
+            remote["links"][0]["qr_svg"]
+                .as_str()
+                .unwrap()
+                .contains("<svg")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_links_are_off_when_remote_access_is() {
+        let (app, _ctx) = test_app();
+        let res = app.oneshot(local_request("/api/remote")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(res).await,
+            serde_json::json!({"auth": "off", "links": []})
+        );
+    }
+
+    fn command_request(content_type: Option<&str>, origin: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/command")
+            .header(header::HOST, "localhost:7679");
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        let mut req = builder
+            .body(Body::from(r#"{"cmd":"join_room","name":"attic"}"#))
+            .expect("test request");
+        req.extensions_mut()
+            .insert(ConnectInfo::<SocketAddr>("127.0.0.1:5000".parse().unwrap()));
+        req
+    }
+
+    #[tokio::test]
+    async fn same_origin_json_commands_are_accepted() {
+        let (app, _ctx) = test_app();
+        let res = app
+            .oneshot(command_request(
+                Some("application/json; charset=utf-8"),
+                Some("http://localhost:7679"),
+            ))
+            .await
+            .unwrap();
+        // The test app has no app loop, so a command that passes every check
+        // fails only when it reaches the closed command channel.
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Any page open in a local browser can send these; none may reach the app loop.
+    #[tokio::test]
+    async fn forged_commands_from_other_websites_are_refused() {
+        // A cross-site POST is refused by its `Origin`, whatever its body.
+        let (app, _ctx) = test_app();
+        let res = app
+            .oneshot(command_request(
+                Some("application/json"),
+                Some("https://evil.example"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Without `Origin`, a form or `no-cors` fetch can only send a simple
+        // content type, which the handler refuses.
+        for content_type in [
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+            None,
+        ] {
+            let (app, _ctx) = test_app();
+            let res = app
+                .oneshot(command_request(content_type, None))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{content_type:?}");
+        }
+    }
+
+    /// WebSocket connections bypass the same-origin policy, so another site's page
+    /// could otherwise subscribe to the history.
+    #[tokio::test]
+    async fn ui_socket_refuses_other_origins() {
+        let (app, _ctx) = test_app();
+        let mut req = local_request("/ws/ui");
+        req.headers_mut().insert(
+            header::ORIGIN,
+            "https://evil.example".parse().expect("origin header"),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A rebinding page is same-origin with itself; its public domain in `Host`
+    /// is what gives it away, even on loopback.
+    #[tokio::test]
+    async fn dns_rebinding_hosts_are_refused_on_loopback() {
+        let (app, _ctx) = test_app();
+        let mut req = local_request("/api/state");
+        req.headers_mut().insert(
+            header::HOST,
+            "evil.example:7679".parse().expect("host header"),
+        );
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

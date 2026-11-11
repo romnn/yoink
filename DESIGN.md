@@ -42,7 +42,10 @@ The architecture was shaped so rooms are an extension, not a rework:
 - **Server/UI**: `/` stays the personal clipboard. `/r/{name}` serves a room
   view (same entry-feed UI, share box scoped to the room); unreserved bare
   paths like `/myroom` redirect to `/r/myroom` so typing a room URL just
-  works. Room routes stay loopback-guarded like everything except `/sync`.
+  works. Room routes are access-guarded like everything except `/sync`:
+  loopback only by default, other devices with the per-run secret link
+  (cookie after first use) under `--remote-ui`, or anyone under
+  `--remote-ui=open`.
 - **App loop**: commands carry an optional scope; clipboard capture and
   auto-apply remain hard-wired to the `devices` scope and are gated by
   `ShareMode`.

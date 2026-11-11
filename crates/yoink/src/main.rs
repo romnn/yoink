@@ -42,6 +42,9 @@
 //!
 //! The server listens on `0.0.0.0` plus a best-effort `IPV6_V6ONLY` `[::]`
 //! socket on the same port, because mDNS advertises IPv6 addresses too.
+//! The web UI and API answer only this machine unless `--remote-ui` admits
+//! other devices: by default with a per-run secret link, printed with a QR code
+//! (`--no-qr` hides the QR code), or with `--remote-ui=open` without any check.
 //!
 //! Trust model: by default every device on the LAN is trusted and syncs the
 //! personal clipboard automatically; blocking one (persisted) stops it.
@@ -49,8 +52,8 @@
 //! pair first. Rooms are always open-join regardless. `--mode` selects how
 //! the OS clipboard is involved (manual / auto-share / mirror), and
 //! `--untrusted` is a one-flag hardened preset for networks you don't control
-//! (forces `--require-pairing` + manual mode and stops advertising joined
-//! room names over mDNS).
+//! (forces `--require-pairing` + manual mode, stops advertising joined
+//! room names over mDNS, and downgrades `--remote-ui=open` to the secret link).
 //!
 //! Config (`config.toml` in the config dir): `device_id` (created on first
 //! run), optional `name` override, `allowed` (paired devices, used under
@@ -62,6 +65,7 @@
 mod app;
 mod banner;
 mod config;
+mod remote_ui;
 
 use anyhow::Context;
 use clap::Parser;
@@ -73,11 +77,12 @@ use tokio::sync::{broadcast, mpsc};
 use yoink_clipboard::ClipboardHandle;
 use yoink_core::{DeviceInfo, DocSet, ShareMode};
 use yoink_discovery::Discovery;
-use yoink_server::{ServerCtx, Settings};
+use yoink_server::{ServerCtx, Settings, UiAccess};
 use yoink_sync::{SyncManager, TrustSettings};
 
 use crate::app::{App, AppChannels};
 use crate::config::Config;
+use crate::remote_ui::RemoteUi;
 
 /// A zero-setup shared clipboard for your LAN.
 #[derive(Debug, Parser)]
@@ -119,8 +124,29 @@ struct Args {
     /// `--require-pairing`) and manual share mode (`--mode manual`, overriding
     /// those flags), and stops advertising your joined room names over mDNS so
     /// strangers can't enumerate them.
+    /// It also turns `--remote-ui=open` into the secret-link mode.
     #[arg(long)]
     untrusted: bool,
+
+    /// Let other devices on your network, such as a phone, open the web UI.
+    /// `token` (what a bare `--remote-ui` means) requires the secret link
+    /// printed at startup, also shown as a QR code here and in the local web
+    /// UI; it changes on every restart. `open` lets anyone on your network in
+    /// without a secret, so they can read your history and change settings.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "AUTH",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "token"
+    )]
+    remote_ui: Option<RemoteUi>,
+
+    /// Don't print the `--remote-ui` QR code in the terminal; the local web UI
+    /// still shows it on demand.
+    #[arg(long = "no-qr")]
+    no_qr: bool,
 }
 
 /// clap value parser for `--mode`: maps the kebab-case spelling to a
@@ -135,6 +161,7 @@ struct EffectiveSettings {
     require_pairing: bool,
     mode: ShareMode,
     advertise_rooms: bool,
+    remote_ui: Option<RemoteUi>,
 }
 
 /// Resolve the effective trust model, share mode and discovery posture from
@@ -142,9 +169,10 @@ struct EffectiveSettings {
 ///
 /// `--untrusted` is the hardened preset for networks you don't control: it
 /// forces strict pairing and manual share mode regardless of the matching
-/// individual flags (warning if an explicit `--mode` is overridden), and keeps
-/// joined room names out of mDNS. Future conservative defaults belong here
-/// too, so the one flag locks them all.
+/// individual flags (warning if an explicit `--mode` is overridden), keeps
+/// joined room names out of mDNS, and requires the secret link for
+/// `--remote-ui=open` (warning when it does). Future conservative defaults
+/// belong here too, so the one flag locks them all.
 fn resolve_hardening(args: &Args) -> EffectiveSettings {
     let require_pairing = args.require_pairing || args.untrusted;
     let mode = if args.untrusted {
@@ -158,10 +186,18 @@ fn resolve_hardening(args: &Args) -> EffectiveSettings {
     } else {
         args.mode
     };
+    let remote_ui = match args.remote_ui {
+        Some(RemoteUi::Open) if args.untrusted => {
+            tracing::warn!("--untrusted requires the secret link; ignoring --remote-ui=open");
+            Some(RemoteUi::Token)
+        }
+        remote_ui => remote_ui,
+    };
     EffectiveSettings {
         require_pairing,
         mode,
         advertise_rooms: !args.untrusted,
+        remote_ui,
     }
 }
 
@@ -221,20 +257,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let (doc_events_tx, doc_rx) = mpsc::channel(app::DOC_EVENT_QUEUE);
     let forwarders = app::wire_scopes(&docs, &config.rooms, &doc_events_tx);
 
-    let listener = bind_listener(args.port).await?;
-    let port = listener
-        .local_addr()
-        .context("failed to read the bound listener address")?
-        .port();
-    // Best-effort: a machine without IPv6 (or with the port taken on v6 by
-    // someone else) still works, peers just have to dial our v4 addresses.
-    let v6_listener = match bind_v6_listener(port) {
-        Ok(listener) => Some(listener),
-        Err(err) => {
-            tracing::warn!(error = %err, port, "failed to bind [::] listener; serving IPv4 only");
-            None
-        }
-    };
+    let listeners = bind_listeners(args.port).await?;
+    let port = listeners.port;
+    let ui_access = remote_ui::access(effective.remote_ui, port)?;
 
     let (clipboard, clipboard_rx) = ClipboardHandle::spawn(Duration::from_millis(400));
     let seeded_rooms: std::collections::HashSet<String> = config.rooms.iter().cloned().collect();
@@ -272,10 +297,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         commands: commands_tx,
         notify: notify_tx.clone(),
     };
-    spawn_web_servers(ctx, listener, v6_listener);
+    spawn_web_servers(ctx, &ui_access, listeners);
 
     let url = format!("http://localhost:{port}");
-    banner::print(&url, &device.name, &device.id);
+    banner::print(&url, &device, &ui_access, !args.no_qr);
     if !args.no_open
         && let Err(err) = open::that(&url)
     {
@@ -317,21 +342,24 @@ async fn run(args: Args) -> anyhow::Result<()> {
 /// the companion `[::]` one. Each runs as its own detached task; an unexpected
 /// `serve` exit is logged but never brings the process down, since the app
 /// loop (clipboard, sync) is the part that must keep running.
-fn spawn_web_servers(
-    ctx: ServerCtx,
-    listener: tokio::net::TcpListener,
-    v6_listener: Option<tokio::net::TcpListener>,
-) {
+fn spawn_web_servers(ctx: ServerCtx, access: &UiAccess, listeners: Listeners) {
+    let Listeners {
+        v4: listener,
+        v6: v6_listener,
+        port: _,
+    } = listeners;
     if let Some(v6_listener) = v6_listener {
         let ctx = ctx.clone();
+        let access = access.clone();
         tokio::spawn(async move {
-            if let Err(err) = yoink_server::serve(v6_listener, ctx).await {
+            if let Err(err) = yoink_server::serve(v6_listener, ctx, access).await {
                 tracing::error!(error = %err, "IPv6 web server exited");
             }
         });
     }
+    let access = access.clone();
     tokio::spawn(async move {
-        if let Err(err) = yoink_server::serve(listener, ctx).await {
+        if let Err(err) = yoink_server::serve(listener, ctx, access).await {
             tracing::error!(error = %err, "web server exited");
         }
     });
@@ -344,6 +372,35 @@ fn resolve_config_dir(flag: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "yoink")
         .context("could not determine a config directory for this platform; pass --config-dir")?;
     Ok(dirs.config_dir().to_path_buf())
+}
+
+/// The web server's listening sockets, all on one port.
+struct Listeners {
+    v4: tokio::net::TcpListener,
+    /// `None` when IPv6 is unavailable; peers then dial our v4 addresses.
+    v6: Option<tokio::net::TcpListener>,
+    /// The bound port, which differs from the requested one when that was 0.
+    port: u16,
+}
+
+/// Bind the primary `0.0.0.0` listener on `port`, then a companion `[::]` one on
+/// the port it got.
+async fn bind_listeners(port: u16) -> anyhow::Result<Listeners> {
+    let v4 = bind_listener(port).await?;
+    let port = v4
+        .local_addr()
+        .context("failed to read the bound listener address")?
+        .port();
+    // Best-effort: a machine without IPv6 (or with the port taken on v6 by
+    // someone else) still works, peers just have to dial our v4 addresses.
+    let v6 = match bind_v6_listener(port) {
+        Ok(listener) => Some(listener),
+        Err(err) => {
+            tracing::warn!(error = %err, port, "failed to bind [::] listener; serving IPv4 only");
+            None
+        }
+    };
+    Ok(Listeners { v4, v6, port })
 }
 
 async fn bind_listener(port: u16) -> anyhow::Result<tokio::net::TcpListener> {
@@ -383,6 +440,7 @@ fn bind_v6_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
 #[cfg(test)]
 mod tests {
     use super::{Args, EffectiveSettings, bind_v6_listener, resolve_hardening};
+    use crate::remote_ui::RemoteUi;
     use clap::Parser as _;
     use yoink_core::ShareMode;
 
@@ -396,6 +454,7 @@ mod tests {
                 require_pairing: true,
                 mode: ShareMode::Manual,
                 advertise_rooms: false,
+                remote_ui: None,
             }
         );
     }
@@ -410,8 +469,40 @@ mod tests {
                 require_pairing: true,
                 mode: ShareMode::AutoShare,
                 advertise_rooms: true,
+                remote_ui: None,
             }
         );
+    }
+
+    #[test]
+    fn remote_ui_is_off_by_default_and_a_bare_flag_means_token() {
+        let remote_ui = |argv: &[&str]| resolve_hardening(&Args::parse_from(argv)).remote_ui;
+        assert_eq!(remote_ui(&["yoink"]), None);
+        assert_eq!(remote_ui(&["yoink", "--remote-ui"]), Some(RemoteUi::Token));
+        assert_eq!(
+            remote_ui(&["yoink", "--remote-ui=token"]),
+            Some(RemoteUi::Token)
+        );
+        assert_eq!(
+            remote_ui(&["yoink", "--remote-ui=open"]),
+            Some(RemoteUi::Open)
+        );
+    }
+
+    /// `require_equals` keeps a bare `--remote-ui` from swallowing the next
+    /// argument as its value.
+    #[test]
+    fn bare_remote_ui_does_not_consume_the_next_argument() {
+        let args = Args::parse_from(["yoink", "--remote-ui", "--no-qr"]);
+        assert_eq!(args.remote_ui, Some(RemoteUi::Token));
+        assert!(args.no_qr);
+        assert!(Args::try_parse_from(["yoink", "--remote-ui", "open"]).is_err());
+    }
+
+    #[test]
+    fn untrusted_turns_open_remote_ui_into_the_secret_link() {
+        let args = Args::parse_from(["yoink", "--untrusted", "--remote-ui=open"]);
+        assert_eq!(resolve_hardening(&args).remote_ui, Some(RemoteUi::Token));
     }
 
     #[tokio::test]

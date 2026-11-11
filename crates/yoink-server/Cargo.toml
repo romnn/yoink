@@ -16,7 +16,9 @@ yoink-sync = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 futures-util = { workspace = true }
+getrandom = { workspace = true }
 parking_lot = { workspace = true }
+qrcode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

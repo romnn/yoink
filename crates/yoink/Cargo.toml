@@ -19,8 +19,10 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 directories = { workspace = true }
 gethostname = { workspace = true }
+if-addrs = { workspace = true }
 open = { workspace = true }
 parking_lot = { workspace = true }
+qrcode = { workspace = true }
 serde = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use yoink_core::{DeviceInfo, DocSet, Scope, ShareMode};
 use yoink_discovery::PeerInfo;
-use yoink_server::{PeerView, ServerCtx, Settings, serve};
+use yoink_server::{PeerView, ServerCtx, Settings, UiAccess, serve};
 use yoink_sync::{SyncManager, TrustSettings};
 
 fn peer(id: &str, name: &str, online: bool, rooms: &[&str]) -> (String, PeerView) {
@@ -102,5 +102,5 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:7691").await?;
     eprintln!("ui fixture on http://127.0.0.1:7691/ and /r/attic");
-    serve(listener, ctx).await
+    serve(listener, ctx, UiAccess::LoopbackOnly).await
 }

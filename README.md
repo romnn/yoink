@@ -45,6 +45,26 @@ its own in-memory feed while yoink is running; restarting starts clean. The
 **Copy** button on any room entry still puts it straight on your local
 clipboard.
 
+## Opening yoink on your phone
+
+The web UI normally answers only the machine yoink runs on. To use it from a
+phone or another device on the same network:
+
+```sh
+yoink --remote-ui          # secret link + QR code
+yoink --remote-ui --no-qr  # same, without the QR code in the terminal
+yoink --remote-ui=open     # no secret: anyone on your network gets in
+```
+
+`--remote-ui` prints a secret link per network address, plus a QR code for
+the most likely one; the local web UI shows the same under **Open on phone**.
+Scanning it sets a cookie in the phone's browser, so later visits need no
+link. The secret changes every time yoink restarts, and anyone who has the
+link can read and share from your yoink, so treat it like a password; it
+travels over plain HTTP, so only use it on networks you trust.
+`--remote-ui=open` skips the secret entirely; under `--untrusted` it falls
+back to the secret link.
+
 ### Trying it on a single machine
 
 Two instances can run side by side — handy for kicking the tires:
@@ -76,7 +96,7 @@ flow locally.
 - **Local UI & API** — each instance serves a small web UI from its own port.
   Everything except the peer sync endpoint is restricted to loopback, so
   other machines on the LAN can sync with you but cannot read your history or
-  flip your settings.
+  flip your settings — unless you let them in with `--remote-ui`.
 
 ## Workspace layout
 
