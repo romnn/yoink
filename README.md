@@ -121,3 +121,7 @@ flow locally.
 - State lives in your platform config dir (`~/.config/yoink` on Linux):
   `config.toml` (device id, name, paired devices, blocked devices, and joined
   rooms). Clipboard history is not persisted.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
