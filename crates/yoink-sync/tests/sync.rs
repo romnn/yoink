@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use yoink_core::{ClipDoc, DeviceInfo, DocSet, PROTOCOL_VERSION, Scope};
+use yoink_core::{ClipDoc, ClipEntry, DeviceInfo, DocSet, PROTOCOL_VERSION, Scope};
 use yoink_discovery::PeerInfo;
 use yoink_sync::{SyncEvent, SyncManager, TrustSettings};
 
@@ -666,8 +666,8 @@ async fn room_syncs_between_strangers_without_touching_devices() {
     // The personal scope stays untouched: no connection, no entries.
     assert!(a.manager.connected(&Scope::Devices).is_empty());
     assert!(b.manager.connected(&Scope::Devices).is_empty());
-    assert!(a.doc.entries().is_empty());
-    assert!(b.doc.entries().is_empty());
+    assert_eq!(a.doc.entries(), Vec::<ClipEntry>::new());
+    assert_eq!(b.doc.entries(), Vec::<ClipEntry>::new());
 }
 
 #[tokio::test(flavor = "multi_thread")]

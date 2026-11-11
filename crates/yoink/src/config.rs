@@ -131,11 +131,11 @@ mod tests {
     fn first_run_creates_and_persists_device_id() {
         let dir = TempDir::new();
         let created = Config::load_or_init(dir.path()).unwrap();
-        assert!(!created.device_id.is_empty());
+        assert_ne!(created.device_id, "");
         assert!(created.name.is_none());
-        assert!(created.allowed.is_empty());
-        assert!(created.blocked.is_empty());
-        assert!(created.rooms.is_empty());
+        assert_eq!(created.allowed, Vec::<String>::new());
+        assert_eq!(created.blocked, Vec::<String>::new());
+        assert_eq!(created.rooms, Vec::<String>::new());
 
         let reloaded = Config::load_or_init(dir.path()).unwrap();
         assert_eq!(created, reloaded);
@@ -180,10 +180,11 @@ mod tests {
         let config = Config::load_or_init(dir.path()).unwrap();
         assert_eq!(config.device_id, "id-2");
         assert!(config.name.is_none());
-        assert!(config.allowed.is_empty());
-        assert!(config.blocked.is_empty());
-        assert!(
-            config.rooms.is_empty(),
+        assert_eq!(config.allowed, Vec::<String>::new());
+        assert_eq!(config.blocked, Vec::<String>::new());
+        assert_eq!(
+            config.rooms,
+            Vec::<String>::new(),
             "a config from before the rooms feature loads with no rooms"
         );
     }
@@ -202,6 +203,6 @@ mod tests {
                 "standup".to_string()
             ]
         );
-        assert!(sanitize_rooms(&[]).is_empty());
+        assert_eq!(sanitize_rooms(&[]), Vec::<String>::new());
     }
 }
